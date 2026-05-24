@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import logging
 from functools import partial
 from typing import Iterable
@@ -103,6 +104,60 @@ def _partition_packed_batch_for_cp(batch: dict[str, torch.Tensor], cp_size: int)
     return batch
 
 
+def _load_align_batch(batch_path: str, is_first: bool, is_last: bool) -> dict:
+    """Load a SteptronOss-saved batch and convert to Megatron-Bridge format.
+
+    SteptronOss key mapping:
+      input_ids  [1, S]  -> tokens      [1, S]
+      position_id [S]    -> position_ids [1, S]
+      labels     [1, S]  -> labels      [1, S]
+      loss_masks [1, S]  -> loss_mask   [1, S]
+      cu_seqlens [N+1]   -> cu_seqlens  [N+1]  (no padding; argmin = len)
+      max_seq_len scalar -> max_seqlen  scalar
+    """
+    batch = torch.load(batch_path, map_location="cpu")
+
+    cu_seqlens = batch.get("cu_seqlens")
+    if cu_seqlens is not None:
+        # SteptronOss cu_seqlens has no zero-padding; tell Megatron the full array is valid.
+        cu_seqlens_argmin = torch.tensor([len(cu_seqlens)], dtype=torch.long)
+        max_seqlen = batch.get("max_seq_len")
+        if max_seqlen is not None:
+            max_seqlen = max_seqlen.unsqueeze(0) if max_seqlen.dim() == 0 else max_seqlen
+        else:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().unsqueeze(0)
+    else:
+        cu_seqlens_argmin = None
+        max_seqlen = None
+
+    position_id = batch.get("position_id")
+    if position_id is not None and position_id.dim() == 1:
+        position_id = position_id.unsqueeze(0)  # [S] -> [1, S]
+
+    result: dict = {"attention_mask": None}
+    if is_first:
+        result["tokens"] = batch["input_ids"].cuda(non_blocking=True)
+        result["position_ids"] = position_id.cuda(non_blocking=True) if position_id is not None else None
+    else:
+        result["tokens"] = None
+        result["position_ids"] = None
+    if is_last:
+        result["labels"] = batch["labels"].cuda(non_blocking=True)
+        result["loss_mask"] = batch["loss_masks"].cuda(non_blocking=True)
+    else:
+        result["labels"] = None
+        result["loss_mask"] = None
+    if cu_seqlens is not None:
+        result["cu_seqlens"] = cu_seqlens.cuda(non_blocking=True)
+        result["cu_seqlens_argmin"] = cu_seqlens_argmin  # host tensor
+        result["max_seqlen"] = max_seqlen  # host tensor
+    else:
+        result["cu_seqlens"] = None
+        result["cu_seqlens_argmin"] = None
+        result["max_seqlen"] = None
+    return result
+
+
 def get_batch_from_iterator(
     data_iterator: Iterable,
     use_mtp: bool = False,
@@ -186,6 +241,37 @@ def get_batch(
         cu_seqlens, cu_seqlens_argmin, max_seqlen, cu_seqlens_unpadded, and
         cu_seqlens_unpadded_argmin
     """
+    # ===== ALIGNMENT: load batch from SteptronOss if env var is set =====
+    _align_batch_path = os.environ.get("MBRIDGE_LOAD_BATCH_PATH", "")
+    print(f"[ALIGN] _align_batch_path: {_align_batch_path}")
+    if _align_batch_path and os.path.exists(_align_batch_path):
+        # is_first = is_pp_first_stage(pg_collection.pp)
+        # is_last = is_pp_last_stage(pg_collection.pp)
+        is_first = True
+        is_last = True
+        if (not is_first) and (not is_last):
+            return None, None, None, None, None, None, None, None, None, None
+        b = _load_align_batch(_align_batch_path, is_first, is_last)
+        print(f"[ALIGN] loaded input batch: {b}")
+        cp_size = pg_collection.cp.size()
+        if cp_size > 1:
+            b = _partition_packed_batch_for_cp(b, cp_size)
+        else:
+            b = get_batch_on_this_cp_rank(b, cp_group=pg_collection.cp)
+        return (
+            b.get("tokens"),
+            b.get("labels"),
+            b.get("loss_mask"),
+            b.get("attention_mask"),
+            b.get("position_ids"),
+            b.get("cu_seqlens"),
+            b.get("cu_seqlens_argmin"),
+            b.get("max_seqlen"),
+            None,
+            None,
+        )
+    # ===== END ALIGNMENT =====
+
     # Determine pipeline stage role via process group collection
     is_first = is_pp_first_stage(pg_collection.pp)
     is_last = is_pp_last_stage(pg_collection.pp)
