@@ -36,6 +36,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from transformers import AutoConfig
 
@@ -418,6 +419,67 @@ class TERowParallelLinear_debug_mlp(TERowParallelLinear):
     def forward(self, x):
         output_parallel = torch.nn.functional.linear(x, self.weight)
         output = reduce_from_tensor_model_parallel_region(output_parallel, group=self._tp_group)
+        return output, None
+
+
+class LinearCrossEntropyModule_debug(LinearCrossEntropyModule):
+    """Bit-for-bit reference of SteptronOss ``OutputEmbedding.output`` with
+    ``fp32_lm_head_out=True``.
+
+    SteptronOss runs the lm-head GEMM in fp32 and keeps the output in fp32
+    (``tensor_parallel/layers.py:177-183``)::
+        output = torch.matmul(input.float(), weight.t().float())
+
+    Megatron's stock ``ColumnParallelLinear.forward`` calls
+    ``linear_with_grad_accumulation_and_async_allreduce`` which runs the GEMM
+    in the input dtype (bf16). This subclass overrides the plain-logits branch
+    of ``LinearCrossEntropyModule.forward`` to do an fp32 ``F.linear`` so the
+    final logits match SteptronOss to the last bit.
+
+    Inherits the production ``__init__`` / parameter init / TP sharding /
+    sharded_state_dict from ``LinearCrossEntropyModule`` (and so from
+    ``ColumnParallelLinear``) so the checkpoint stays compatible — only
+    ``forward`` is replaced. Applied post-construction via ``__class__`` swap
+    in ``Step35ModelProvider.provide`` when ``USE_DEBUG_SUBMODULE=1``.
+
+    Limitations (alignment-only):
+      - ``output_cross_entropy_loss=True`` (fused linear+CE) is delegated to
+        the production class; the SteptronOss bit-for-bit alignment runs use
+        the plain-logits branch.
+      - ``TP=1`` and ``sequence_parallel=False`` (matches the alignment runs).
+        For ``TP>1`` mirror ``ColumnParallelLinear.forward``'s
+        ``copy_to_tensor_model_parallel_region`` / output-gather machinery
+        here. Step3.5 sets ``bias=False`` so the bias add is skipped, and
+        the production config has ``gather_output=False`` so no gather is
+        performed (parallel logits are returned).
+    """
+
+    def forward(
+        self,
+        input_,
+        weight=None,
+        runtime_gather_output=None,
+        output_cross_entropy_loss=False,
+        labels=None,
+        reduction="none",
+        ignore_index=-100,
+    ):
+        if output_cross_entropy_loss:
+            return super().forward(
+                input_,
+                weight,
+                runtime_gather_output,
+                output_cross_entropy_loss=True,
+                labels=labels,
+                reduction=reduction,
+                ignore_index=ignore_index,
+            )
+
+        w = weight if weight is not None else self.weight
+        # Mirror SteptronOss fp32_output=True (layers.py:177-183):
+        #   output = matmul(input.float(), weight.t().float())
+        # No bias (Step3.5 bias=False); no TP gather (gather_output=False).
+        output = F.linear(input_.float(), w.float())
         return output, None
 
 
@@ -1069,6 +1131,16 @@ def _build_step35_layer_spec(cfg, **kw):
             # MTP spec use MLP and so are skipped).
             if getattr(_spec.submodules.mlp, "module", None) is MoELayer:
                 _spec.submodules.mlp.module = MoELayer_debug
+
+        # Block-level ``layer_norm`` is the builder for the decoder's
+        # ``final_layernorm`` (TransformerBlock.__init__:387-391). Stock TENorm
+        # (te.RMSNorm) normalizes + multiplies γ all in input dtype (bf16),
+        # while SteptronOss ``OutputEmbedding.norm`` with ``fp32_rms_norm=True``
+        # normalizes in fp32 then casts back to bf16 for the (γ+1) multiply
+        # (parallel_embedding.py:152-157). Swap to TENorm_debug — which already
+        # mirrors that bit-for-bit — so the post-decoder hidden state going
+        # into the lm_head matches SteptronOss.
+        block_submodules.layer_norm = TENorm_debug
 
     print(f"for debug, rank: {torch.distributed.get_rank()}, block_submodules:")
     print(_format_spec(block_submodules, indent=1))

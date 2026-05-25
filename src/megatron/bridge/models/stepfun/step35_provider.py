@@ -31,11 +31,13 @@ sub-modules.
 """
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -220,3 +222,39 @@ class Step35ModelProvider(GPTModelProvider):
     sliding_attention_setting: dict[str, Any] | None = None
     rotary_base_per_layer: list[float] | None = None
     head_wise_attn_gate: Optional[bool] = False
+
+    def provide(self, pre_process=None, post_process=None, vp_stage=None):
+        """Build the GPTModel and apply Step3.5 post-construction patches.
+
+        Under ``USE_DEBUG_SUBMODULE=1`` we ``__class__``-swap ``output_layer``
+        to ``LinearCrossEntropyModule_debug`` so the lm_head GEMM runs in fp32,
+        matching SteptronOss ``OutputEmbedding.output`` with
+        ``fp32_lm_head_out=True``. ``__class__`` swap leaves the constructed
+        weight / TP sharding / sharded_state_dict state untouched — only
+        ``forward`` is replaced.
+
+        ``output_layer`` exists only on the last pipeline stage (and on the
+        first stage when ``share_embeddings_and_output_weights=True``); the
+        attribute lookup is bounds-checked rather than asserted.
+        """
+        model = super().provide(
+            pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
+        )
+        if os.environ.get("USE_DEBUG_SUBMODULE", "0") == "1":
+            # Deferred import to avoid the step35_bridge → step35_provider →
+            # step35_bridge import cycle.
+            from megatron.bridge.models.stepfun.step35_bridge import (
+                LinearCrossEntropyModule_debug,
+            )
+
+            out = getattr(model, "output_layer", None)
+            if isinstance(out, LinearCrossEntropyModule) and not isinstance(
+                out, LinearCrossEntropyModule_debug
+            ):
+                out.__class__ = LinearCrossEntropyModule_debug
+                print(
+                    f"[ALIGN] Step35ModelProvider.provide: swapped output_layer "
+                    f"to LinearCrossEntropyModule_debug (fp32 lm_head GEMM)",
+                    flush=True,
+                )
+        return model
