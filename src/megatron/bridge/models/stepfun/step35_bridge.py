@@ -994,24 +994,33 @@ class MoELayer_debug(MoELayer):
             else:
                 _shared_limit = _get_swiglu_limit(_layer_id, self.config.swiglu_limits)
                 _shared_src = "swiglu_limits"
-            # Megatron-Core has no ``activation_func_clamp_value_shared``: routed
-            # GroupedMLP/SequentialMLP/TEGroupedMLP and shared SharedExpertMLP
-            # both read ``self.config.activation_func_clamp_value``. SteptronOss
-            # asymmetric layers (e.g. step3.5 layer 43: swiglu_limits=7,
-            # swiglu_limits_shared=0) need the shared expert to see a different
-            # clip than routed. Temporarily swap the config field around the
-            # shared_experts() call so SharedExpertMLP's clip matches SteptronOss.
-            _prev_clamp = self.config.activation_func_clamp_value
-            self.config.activation_func_clamp_value = _shared_limit
             print(
                 f"for debug, layer_number: {_layer_id}, in MoELayer_debug.forward, "
-                f"shared_expert clamp override: {_prev_clamp} -> {_shared_limit} (from {_shared_src})",
+                f"shared_expert clamp: {_shared_limit} (from {_shared_src})",
                 flush=True,
             )
-            try:
-                shared_out = self.shared_experts(hidden_states)
-            finally:
-                self.config.activation_func_clamp_value = _prev_clamp
+            # Replicate SteptronOss MoeShareExpertFFN / FeedForward exactly so
+            # the shared expert is bit-equivalent (modulo bf16 rounding):
+            #   z, _ = linear_fc1(hidden_states)
+            #   z = _swiglu_with_clip_after_silu(z, shared_limit)   # clip AFTER silu
+            #   shared_out, _ = linear_fc2(z)                       # no glu_linear_offset
+            # SharedExpertMLP.forward() would otherwise call MLP.forward(), which
+            # uses bias_swiglu_impl / glu() — both clip BEFORE silu and add
+            # glu_linear_offset, neither of which matches SteptronOss
+            # ``steptronoss/model/common/feed_forward.py::activation``.
+            # We keep SharedExpertMLP's linear_fc1 / linear_fc2 modules so TP/SP
+            # and any FP8 wiring is preserved; only the activation is overridden.
+            sh = self.shared_experts
+            fc1_out, fc1_bias = sh.linear_fc1(hidden_states)
+            if fc1_bias is not None:
+                fc1_out = fc1_out + fc1_bias
+            act_out = _swiglu_with_clip_after_silu(fc1_out, _shared_limit)
+            shared_out, fc2_bias = sh.linear_fc2(act_out)
+            if fc2_bias is not None:
+                shared_out = shared_out + fc2_bias
+            if sh.use_shared_expert_gate:
+                gate_logits = F.linear(hidden_states, sh.gate_weight)
+                shared_out = shared_out * F.sigmoid(gate_logits)
             if _prefix is not None:
                 _maybe_dump_moe_io(shared_out, f"{_prefix}_ffn_shared_out")
             output = routed.reshape(S, B, H) + shared_out
