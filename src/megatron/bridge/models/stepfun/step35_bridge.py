@@ -93,9 +93,9 @@ def _swiglu_with_clip_after_silu(gate_up, limit):
 
 
 def _swiglu_with_clip_before_silu(gate_up, limit):
-    """SteptronOss-equivalent SwiGLU with optional clip.
+    """Megatron-Core-equivalent SwiGLU with optional clip.
 
-    Mirrors ``steptronoss/model/common/feed_forward.py:20-26`` bit-for-bit:
+    Mirrors ``megatron/core/fusions/fused_bias_swiglu.py:51-58`` bit-for-bit:
         l, r = chunk(x, 2, dim=-1)
         if limit:
             l = l.clamp(max=limit)
@@ -926,8 +926,12 @@ class MoELayer_debug(MoELayer):
         print(f"for debug, layer_number: {_layer_id}, in MoELayer_debug.forward, self._routed_scaling_factor is {self._routed_scaling_factor}")
 
         if self.use_shared_expert and self.shared_experts is not None:
-            _shared_limit = _get_swiglu_limit(_layer_id, self.config.swiglu_limits_shared)
-            print(f"for debug, layer_number: {_layer_id}, in MoELayer_debug.forward, _shared_limit is {_shared_limit}")
+            if os.environ.get("MEGATRON_SWIGLU_WITH_CLIP_LIMITS_SHARED_EXPERT","0") == "1":
+                _shared_limit = _get_swiglu_limit(_layer_id, self.config.swiglu_limits_shared)
+                print(f"for debug, layer_number: {_layer_id}, in MoELayer_debug.forward, _shared_limit is {_shared_limit} from swiglu_limits_shared")
+            else:
+                _shared_limit = _get_swiglu_limit(_layer_id, self.config.swiglu_limits)
+                print(f"for debug, layer_number: {_layer_id}, in MoELayer_debug.forward, _shared_limit is {_shared_limit} from swiglu_limits")
             if _shared_limit is not None:
                 print(
                     f"[ALIGN][WARN] layer {_layer_id}: swiglu_limits_shared={_shared_limit} "
