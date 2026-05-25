@@ -146,6 +146,17 @@ class Step35DecoderLayer(TransformerLayer):
             pp_layer_offset=pp_layer_offset,
         )
 
+        # Expose the resolved global 0-indexed layer_idx on ``core_attention`` so
+        # ``TEDotProductAttention_debug.forward`` can gate SWA via
+        # ``config.layer_types[layer_idx] == "sliding_attention"``. Without this
+        # the SWA branch is skipped (``getattr(self, "_layer_idx", None)`` is
+        # None) and sliding layers silently fall back to pure causal SDPA, which
+        # diverges from SteptronOss on any chunk longer than the window.
+        self._layer_idx = layer_idx
+        core_attn = getattr(getattr(self, "self_attention", None), "core_attention", None)
+        if core_attn is not None:
+            core_attn._layer_idx = layer_idx
+
 
 class Step35SharedExpertMLP(SharedExpertMLP):
     """Shared-expert MLP for Step-3.5 honoring a per-shared-expert SwiGLU clamp.
