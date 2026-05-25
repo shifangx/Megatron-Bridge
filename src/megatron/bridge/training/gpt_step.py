@@ -1161,17 +1161,36 @@ def _forward_step_common(
                     f"[ALIGN] [rank={torch.distributed.get_rank()}] removed intermediate activation hooks"
                 )
             # ===== ALIGNMENT: lm-head loss path dumps =====
-            # ``output_tensor`` is the per-token loss [B, S] returned by
-            # GPTModel.compute_language_model_loss when labels are passed
-            # (same tensor that loss_func will mask & reduce). DUMP_LMHEAD
-            # gates this; idempotent file checks let the first forward win
-            # across replay/recompute.
-            if os.environ.get("DUMP_LMHEAD", "0") == "1" and _intermediate_dir:
+            # Mirror SteptronOss NTPTrainerConfig.loss_func() exactly so the
+            # per-token loss tensor matches in shape, dtype, and reduction
+            # order:
+            #   logits [B,S,V/tp] -> transpose -> [S,B,V/tp]
+            #   labels [B,S]      -> transpose -> [S,B]
+            #   losses = vocab_parallel_cross_entropy(logits.float(), labels) -> [S,B] fp32
+            #   losses.transpose(1,0).contiguous()                            -> [B,S] fp32
+            # Only PP last stage holds logits, so gate on is_pp_last_stage.
+            # Run a labels=None forward to bypass GPTModel's internal CE and
+            # obtain raw logits; idempotent file checks let the first forward
+            # win across replay/recompute.
+            if (
+                os.environ.get("DUMP_LMHEAD", "0") == "1"
+                and _intermediate_dir
+                and is_pp_last_stage(pg_collection.pp)
+            ):
+                from megatron.core.tensor_parallel import vocab_parallel_cross_entropy
+
                 os.makedirs(_intermediate_dir, exist_ok=True)
+                with torch.no_grad():
+                    _lmhead_logits = model(**{**forward_args, "labels": None})  # [B,S,V/tp]
+                    _logits_sbv = _lmhead_logits.transpose(0, 1).contiguous()  # [S,B,V/tp]
+                    _labels_sb = labels.transpose(0, 1).contiguous()  # [S,B]
+                    _losses_sb = vocab_parallel_cross_entropy(_logits_sbv.float(), _labels_sb)  # [S,B] fp32
+                    _lm_loss_per_token = _losses_sb.transpose(1, 0).contiguous()  # [B,S] fp32
+
                 for _name, _tensor in (
                     ("labels", labels),
                     ("loss_mask", loss_mask),
-                    ("lm_loss_per_token", output_tensor),
+                    ("lm_loss_per_token", _lm_loss_per_token),
                 ):
                     if not isinstance(_tensor, torch.Tensor):
                         continue
