@@ -928,20 +928,28 @@ class MoELayer_debug(MoELayer):
         if self.use_shared_expert and self.shared_experts is not None:
             if os.environ.get("MEGATRON_SWIGLU_WITH_CLIP_LIMITS_SHARED_EXPERT","0") == "1":
                 _shared_limit = _get_swiglu_limit(_layer_id, self.config.swiglu_limits_shared)
-                print(f"for debug, layer_number: {_layer_id}, in MoELayer_debug.forward, _shared_limit is {_shared_limit} from swiglu_limits_shared")
+                _shared_src = "swiglu_limits_shared"
             else:
                 _shared_limit = _get_swiglu_limit(_layer_id, self.config.swiglu_limits)
-                print(f"for debug, layer_number: {_layer_id}, in MoELayer_debug.forward, _shared_limit is {_shared_limit} from swiglu_limits")
-            if _shared_limit is not None:
-                print(
-                    f"[ALIGN][WARN] layer {_layer_id}: swiglu_limits_shared={_shared_limit} "
-                    f"but MoELayer_debug currently routes the shared expert through Megatron's "
-                    f"fused SharedExpertMLP without clip — numerical alignment with SteptronOss "
-                    f"will diverge on this layer. Reimplement the shared-expert forward inline "
-                    f"to apply _swiglu_with_clip before relying on this layer's dumps.",
-                    flush=True,
-                )
-            shared_out = self.shared_experts(hidden_states)
+                _shared_src = "swiglu_limits"
+            # Megatron-Core has no ``activation_func_clamp_value_shared``: routed
+            # GroupedMLP/SequentialMLP/TEGroupedMLP and shared SharedExpertMLP
+            # both read ``self.config.activation_func_clamp_value``. SteptronOss
+            # asymmetric layers (e.g. step3.5 layer 43: swiglu_limits=7,
+            # swiglu_limits_shared=0) need the shared expert to see a different
+            # clip than routed. Temporarily swap the config field around the
+            # shared_experts() call so SharedExpertMLP's clip matches SteptronOss.
+            _prev_clamp = self.config.activation_func_clamp_value
+            self.config.activation_func_clamp_value = _shared_limit
+            print(
+                f"for debug, layer_number: {_layer_id}, in MoELayer_debug.forward, "
+                f"shared_expert clamp override: {_prev_clamp} -> {_shared_limit} (from {_shared_src})",
+                flush=True,
+            )
+            try:
+                shared_out = self.shared_experts(hidden_states)
+            finally:
+                self.config.activation_func_clamp_value = _prev_clamp
             if _prefix is not None:
                 _maybe_dump_moe_io(shared_out, f"{_prefix}_ffn_shared_out")
             output = routed.reshape(S, B, H) + shared_out
