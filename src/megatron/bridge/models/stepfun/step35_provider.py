@@ -116,7 +116,7 @@ class Step35DecoderLayer(TransformerLayer):
                 # Override window/Q/KV shape on the deep-copy so sub-modules built
                 # by super().__init__ see sliding-layer shapes. Keys are already
                 # Megatron-facing — HF→mcore renaming happens upstream in
-                # Step35Bridge.provider_bridge.
+                # ``Step35Bridge.provider_bridge``.
                 config.window_size = config.sliding_attention_setting["window_size"]
                 config.num_attention_heads = config.sliding_attention_setting["num_attention_heads"]
                 config.num_query_groups = config.sliding_attention_setting["num_query_groups"]
