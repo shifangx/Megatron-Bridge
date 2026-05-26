@@ -17,8 +17,17 @@ from .step35 import (
     step35_196b_a11b_pretrain_config,
 )
 
+# Step3.7 (step37 / step3p7) vision-language models
+from .step37 import (
+    step37_321b_a38b_sft_config,
+    step37_smoke_sft_config,
+)
+
 
 __all__ = [
     # Step3.5 models
     "step35_196b_a11b_pretrain_config",
+    # Step3.7 vision-language models
+    "step37_321b_a38b_sft_config",
+    "step37_smoke_sft_config",
 ]

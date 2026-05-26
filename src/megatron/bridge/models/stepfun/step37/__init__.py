@@ -12,27 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from megatron.bridge.models.stepfun.step35_bridge import Step35Bridge
-from megatron.bridge.models.stepfun.step37.step37_model import Step37Model
+"""Step-3.7 (step3p7 / step37) vision-language model components."""
+
+# Core model components
 from megatron.bridge.models.stepfun.step37.configuration_step37 import (
     Step37Config,
     Step37VisionConfig,
 )
+from megatron.bridge.models.stepfun.step37.projector import Step37Projector
+from megatron.bridge.models.stepfun.step37.step37_model import Step37Model
 from megatron.bridge.models.stepfun.step37.vision_model import Step37VisionTransformer
-from megatron.bridge.models.stepfun.step37_bridge import Step37Bridge
-from megatron.bridge.models.stepfun.step37_provider import (
-    Step37ModelProvider,
-    Step37VisionProviderConfig,
-)
 
 
 __all__ = [
-    "Step35Bridge",
-    "Step37Bridge",
     "Step37Config",
     "Step37Model",
-    "Step37ModelProvider",
+    "Step37Projector",
     "Step37VisionConfig",
-    "Step37VisionProviderConfig",
     "Step37VisionTransformer",
 ]
