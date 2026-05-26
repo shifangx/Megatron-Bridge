@@ -1328,6 +1328,73 @@ def kimi_k25_vl_collate_fn(
     return result
 
 
+def step3_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
+    """Collate function for Step-3 / Step-3.7 VL model (``Step3VLProcessor``).
+
+    The Step-3 processor's ``__call__`` does not forward kwargs to its tokenizer
+    (no ``padding=True`` accepted) and replaces ``<im_patch>`` placeholders
+    inline, so we process each example individually then pad/stack manually.
+    """
+    if not HAVE_QWEN_VL_UTILS:
+        raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
+
+    skipped_tokens = extract_skipped_token_ids(processor)
+    tokenizer = getattr(processor, "tokenizer", processor)
+    pad_id = getattr(tokenizer, "pad_token_id", 0) or 0
+
+    per_example_input_ids: list[torch.Tensor] = []
+    pixel_values_list: list[torch.Tensor] = []
+    for example in examples:
+        text = processor.apply_chat_template(example["conversation"], tokenize=False)
+        imgs = process_vision_info(example["conversation"])[0]
+        if imgs is None:
+            imgs = []
+        elif not isinstance(imgs, list):
+            imgs = [imgs]
+
+        out = processor(text=[text], images=imgs, return_tensors="pt")
+        per_example_input_ids.append(out["input_ids"][0])
+        if "pixel_values" in out and out["pixel_values"] is not None:
+            pixel_values_list.append(out["pixel_values"])
+
+    max_len = max(t.shape[0] for t in per_example_input_ids)
+    batch_size = len(examples)
+    input_ids = torch.full((batch_size, max_len), pad_id, dtype=per_example_input_ids[0].dtype)
+    for i, t in enumerate(per_example_input_ids):
+        input_ids[i, : t.shape[0]] = t
+
+    labels = input_ids.clone()[:, 1:].contiguous()
+    labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
+    labels[torch.isin(labels, skipped_tokens)] = -100
+
+    position_ids = (
+        torch.arange(max_len, device=input_ids.device)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+        .clone()
+        .contiguous()
+    )
+
+    loss_masks = [
+        create_multiturn_loss_mask_by_search(example, input_ids[i], processor, skipped_tokens)
+        for i, example in enumerate(examples)
+    ]
+    loss_mask_t = torch.tensor(loss_masks, dtype=torch.float, device=input_ids.device)
+    loss_mask_t = torch.cat([loss_mask_t[:, 1:], torch.zeros_like(loss_mask_t[:, :1])], dim=1)
+    labels = labels.masked_fill(loss_mask_t == 0, -100)
+
+    pixel_values = torch.cat(pixel_values_list).to(torch.bfloat16) if pixel_values_list else None
+    visual_inputs = GenericVisualInputs(pixel_values=pixel_values)
+
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "loss_mask": loss_mask_t,
+        "position_ids": position_ids,
+        "visual_inputs": visual_inputs,
+    }
+
+
 # Mapping of processor types to their collate functions
 COLLATE_FNS = {
     "Qwen2_5_VLProcessor": qwen2_5_collate_fn,
@@ -1339,5 +1406,6 @@ COLLATE_FNS = {
     "Qwen2AudioProcessor": qwen2_audio_collate_fn,
     "Glm4vProcessor": glm4v_collate_fn,
     "KimiK25Processor": kimi_k25_vl_collate_fn,
+    "Step3VLProcessor": step3_collate_fn,
     "default": default_collate_fn,
 }
