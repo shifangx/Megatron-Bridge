@@ -38,6 +38,7 @@ from typing import Any, Optional
 import torch
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
+from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -158,6 +159,15 @@ class Step35DecoderLayer(TransformerLayer):
         core_attn = getattr(getattr(self, "self_attention", None), "core_attention", None)
         if core_attn is not None:
             core_attn._layer_idx = layer_idx
+
+        # When ``USE_DEBUG_SUBMODULE=1`` swaps ``submodules.mlp.module`` from
+        # ``MoELayer`` to ``MoELayer_debug``, TransformerLayer.__init__ skips its
+        # ``submodules.mlp.module == MoELayer`` branch (exact-class compare, not
+        # ``issubclass``) and therefore never forwards ``layer_number`` into the
+        # MoE module. Patch it back here so the router and the debug forward
+        # both see the correct 1-indexed PP-stage layer number.
+        if isinstance(self.mlp, BaseMoELayer) and getattr(self.mlp, "layer_number", None) is None:
+            self.mlp.set_layer_number(self.layer_number)
 
 
 class Step35SharedExpertMLP(SharedExpertMLP):
