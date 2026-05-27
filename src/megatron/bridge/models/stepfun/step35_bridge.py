@@ -73,7 +73,7 @@ def _get_swiglu_limit(layer_id, limits):
     return float(v)
 
 
-def _swiglu_with_clip(gate_up, limit):
+def _swiglu_with_clip_after_silu(gate_up, limit):
     """SteptronOss-equivalent SwiGLU with optional clip.
 
     Mirrors ``steptronoss/model/common/feed_forward.py:20-26`` bit-for-bit:
@@ -85,12 +85,38 @@ def _swiglu_with_clip(gate_up, limit):
         return l * r
     """
     l, r = torch.chunk(gate_up, 2, dim=-1)
+    l = F.silu(l)
+    if limit is not None:
+        l = l.clamp(max=limit)
+        r = r.clamp(min=-limit, max=limit)
+    return l * r
+
+
+def _swiglu_with_clip_before_silu(gate_up, limit):
+    """SteptronOss-equivalent SwiGLU with optional clip.
+
+    Mirrors ``steptronoss/model/common/feed_forward.py:20-26`` bit-for-bit:
+        l, r = chunk(x, 2, dim=-1)
+        if limit:
+            l = l.clamp(max=limit)
+            r = r.clamp(-limit, limit)
+        l = silu(l)
+        return l * r
+    """
+    l, r = torch.chunk(gate_up, 2, dim=-1)
     if limit is not None:
         l = l.clamp(max=limit)
         r = r.clamp(min=-limit, max=limit)
     l = F.silu(l)
     return l * r
 
+print(f"MEGATRON_SWIGLU_WITH_CLIP_AFTER_SILU: {os.environ['MEGATRON_SWIGLU_WITH_CLIP_AFTER_SILU']}")
+if os.environ["MEGATRON_SWIGLU_WITH_CLIP_AFTER_SILU"] == "1":
+    _swiglu_with_clip = _swiglu_with_clip_after_silu
+    print("Using _swiglu_with_clip_after_silu")
+else:
+    _swiglu_with_clip = _swiglu_with_clip_before_silu
+    print("Using _swiglu_with_clip_before_silu")
 
 # Register the Step3.5 config with transformers AutoConfig.
 # This allows AutoConfig.from_pretrained to resolve "step3p5" without requiring
