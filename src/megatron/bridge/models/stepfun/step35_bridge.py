@@ -111,7 +111,7 @@ def _swiglu_with_clip_before_silu(gate_up, limit):
     l = F.silu(l)
     return l * r
 
-print(f"MEGATRON_SWIGLU_WITH_CLIP_AFTER_SILU: {os.environ['MEGATRON_SWIGLU_WITH_CLIP_AFTER_SILU']}")
+print(f"MEGATRON_SWIGLU_WITH_CLIP_AFTER_SILU: {os.environ.get('MEGATRON_SWIGLU_WITH_CLIP_AFTER_SILU','0')}")
 if os.environ.get("MEGATRON_SWIGLU_WITH_CLIP_AFTER_SILU","0") == "1":
     _swiglu_with_clip = _swiglu_with_clip_after_silu
     print("Using _swiglu_with_clip_after_silu")
