@@ -35,6 +35,8 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from transformers import AutoConfig
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
@@ -55,6 +57,40 @@ from megatron.bridge.models.stepfun.step35_provider import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _get_swiglu_limit(layer_id, limits):
+    """Return the per-layer SwiGLU clip value, or ``None`` to mean "no clip".
+
+    SteptronOss treats ``0.0`` the same as "no clip" (``if swiglu_limit:`` falls
+    through), so this helper normalizes both ``None`` and ``0.0`` to ``None``.
+    """
+    if limits is None or layer_id is None or layer_id < 0 or layer_id >= len(limits):
+        return None
+    v = limits[layer_id]
+    if v is None or float(v) == 0.0:
+        return None
+    return float(v)
+
+
+def _swiglu_with_clip(gate_up, limit):
+    """SteptronOss-equivalent SwiGLU with optional clip.
+
+    Mirrors ``steptronoss/model/common/feed_forward.py:20-26`` bit-for-bit:
+        l, r = chunk(x, 2, dim=-1)
+        l = silu(l)
+        if limit:
+            l = l.clamp(max=limit)
+            r = r.clamp(-limit, limit)
+        return l * r
+    """
+    l, r = torch.chunk(gate_up, 2, dim=-1)
+    if limit is not None:
+        l = l.clamp(max=limit)
+        r = r.clamp(min=-limit, max=limit)
+    l = F.silu(l)
+    return l * r
+
 
 # Register the Step3.5 config with transformers AutoConfig.
 # This allows AutoConfig.from_pretrained to resolve "step3p5" without requiring
@@ -225,6 +261,37 @@ class TENorm_debug(te.RMSNorm):
         return y * weight
 
 
+class TENorm_debug_mlp(TENorm_debug):
+    """MoE-layer ``pre_mlp_layernorm`` variant of ``TENorm_debug``.
+
+    Identical numerics — kept as a separate subclass purely for clarity so the
+    layer's ``__repr__`` distinguishes the standalone RMSNorm before the MoE
+    block (Megatron's equivalent of SteptronOss ``ffn_norm``) from the one
+    used for ``q_layernorm`` / ``k_layernorm`` inside self-attention.
+
+    Constructor signature follows ``TENorm`` (``config, hidden_size, eps``) so
+    ``TransformerLayer.__init__`` can build it via ``submodules.pre_mlp_layernorm``
+    without any changes.
+
+    Used by ``_build_step35_layer_spec``: MoE layers carry a real RMSNorm at
+    ``pre_mlp_layernorm`` while dense layers fold the LN into ``linear_fc1``
+    (and therefore keep ``pre_mlp_layernorm = IdentityOp``). The swap only fires
+    when the spec field is not IdentityOp.
+    """
+
+    def forward(self, x):
+        in_dtype = x.dtype
+        x_fp32 = x.float()
+        l2_norm_inv = torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps_value)
+        y = (x_fp32 * l2_norm_inv).to(in_dtype)
+
+        weight = self.weight
+        if self.config.layernorm_zero_centered_gamma:
+            weight = weight + 1.0
+
+        return y * weight, x
+
+
 class TERowParallelLinear_debug(TERowParallelLinear):
     """Bit-for-bit reference of SteptronOss's ``wo`` (RowParallelLinear, bias=False).
 
@@ -281,6 +348,48 @@ class TERowParallelLinear_debug(TERowParallelLinear):
             x = x * gate_states.sigmoid()
             x = x.view(*gate_states.shape[:2], -1)
 
+        output_parallel = torch.nn.functional.linear(x, self.weight)
+        output = reduce_from_tensor_model_parallel_region(output_parallel, group=self._tp_group)
+        return output, None
+
+
+class TELayerNormColumnParallelLinear_debug_mlp(TELayerNormColumnParallelLinear_debug):
+    """Dense-MLP variant of ``TELayerNormColumnParallelLinear_debug``.
+
+    Dense MLP's ``linear_fc1`` call site is::
+        intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)   # mlp.py:248
+    which unpacks **2 elements**. The attention base class returns
+    ``(out_hidden, bias, ln_output)`` to satisfy SelfAttention's
+    ``mixed_qkv, _, _ = self.linear_qkv(...)`` (attention.py:1672), so here we
+    strip the ``ln_output`` slot before returning. Numerical logic
+    (fp32-norm → cast → bf16-multiply-γ → no-bias linear) is inherited
+    unchanged from ``TELayerNormColumnParallelLinear_debug``.
+
+    Used in ``_build_step35_layer_spec`` to swap dense layers' ``linear_fc1``
+    so the ``layer_NNN_ffn_norm`` / ``ffn_input`` / downstream dumps match
+    SteptronOss bit-for-bit.
+    """
+
+    def forward(self, x):
+        out_hidden, ret_bias, _ = super().forward(x)
+        return out_hidden, ret_bias
+
+
+class TERowParallelLinear_debug_mlp(TERowParallelLinear):
+    """Dense-MLP variant of ``TERowParallelLinear_debug`` — no head_wise_gate logic.
+
+    Mirrors SteptronOss ``FeedForward.w2`` (RowParallelLinear, bias=False)::
+        output_parallel = F.linear(x, self.weight)
+        output          = reduce_from_tensor_model_parallel_region(output_parallel)
+        return output, None
+
+    Unlike the attention-side ``TERowParallelLinear_debug``, MLP's ``linear_fc2``
+    never receives a head_wise_gate injection from upstream, so the gate path
+    is removed entirely for clarity. Step3.5 sets ``bias=False``, so
+    ``self.bias`` is ignored.
+    """
+
+    def forward(self, x):
         output_parallel = torch.nn.functional.linear(x, self.weight)
         output = reduce_from_tensor_model_parallel_region(output_parallel, group=self._tp_group)
         return output, None
@@ -373,6 +482,50 @@ def _maybe_save_sdpa_io(
         }
         torch.save(meta, meta_path)
         print(f"[ALIGN] sdpa_io meta {prefix}: {meta}", flush=True)
+
+
+@torch._dynamo.disable
+def _maybe_dump_moe_io(tensor, name: str) -> None:
+    """Dump a MoE intermediate tensor to ``MBRIDGE_SAVE_INTERMEDIATE_PATH``.
+
+    Used by ``MoELayer_debug.forward`` to expose router logits / routed combined
+    output / shared expert output under the same ``layer_NNN_ffn_*`` names that
+    SteptronOss schedules.py writes — so ``compare_intermediate_activations.py``
+    can diff them 1:1.
+
+    Idempotent (existing files skipped) and ``@torch._dynamo.disable`` so the
+    file I/O doesn't trip dynamo trace.
+    """
+    if os.environ.get("DUMP_FINEGRAIN", "1") != "1":
+        return
+    save_dir = os.environ.get("MBRIDGE_SAVE_INTERMEDIATE_PATH")
+    if not save_dir:
+        return
+    if os.environ.get("MBRIDGE_DUMP_PP_RANK0_ONLY", "1") == "1":
+        if parallel_state.get_pipeline_model_parallel_rank() != 0:
+            return
+    if not isinstance(tensor, torch.Tensor):
+        return
+    os.makedirs(save_dir, exist_ok=True)
+    path = os.path.join(save_dir, f"{name}.pt")
+    if os.path.exists(path):
+        print(
+            f"[ALIGN] moe dump skip {name} (file already exists, expected with multi-rank): {path}",
+            flush=True,
+        )
+        return
+    torch.save(tensor.detach().cpu(), path)
+    print(
+        f"[ALIGN] moe dump saved {name}: shape={tuple(tensor.shape)}, dtype={tensor.dtype}",
+        flush=True,
+    )
+    if tensor.is_floating_point():
+        tf = tensor.detach().float()
+        print(
+            f"[ALIGN] moe dump stats {name}: min={tf.min():.6f}  max={tf.max():.6f}  mean={tf.mean():.6f}  std={tf.std():.6f}",
+            flush=True,
+        )
+    print(f"[ALIGN] moe dump {name}: {tensor}", flush=True)
 
 
 class TEDotProductAttention_debug(TEDotProductAttention):
@@ -556,6 +709,256 @@ class TEDotProductAttention_debug(TEDotProductAttention):
         return out.reshape(t_q, np_q * hn)
 
 
+class MoELayer_debug(MoELayer):
+    """SteptronOss-aligned MoE forward.
+
+    Reuses ``MoELayer.__init__`` so router / experts / shared_experts are built
+    with the production submodules (and the checkpoint loads unchanged). Only
+    ``forward`` is replaced with a SteptronOss-style pipeline so the routed
+    output matches ``MoeShareExpertFFN.forward`` (moe_share_expert_ffn.py:27) +
+    ``MoEBlock.forward`` (moe_block.py:376) bit-for-bit.
+
+    Pipeline (mirrors SteptronOss):
+        x : [S, B, H]
+        x = x.reshape(-1, H)                                # [T, H]
+        logits = F.linear(x.float(), router.weight.float()) # [T, E] fp32
+        gate_prob = sigmoid(logits)                          # Step3.5 enable_sigmoid_router=True
+        sort + take top-K → topk_ids [T, K], topk_prob [T, K]
+        token_weights = topk_prob / sum(topk_prob)           # norm_expert_weight=True
+        # per-expert SwiGLU + weighted sum back to [T, H]
+        for k in range(K):
+            for e in range(E):
+                mask = (topk_ids[:, k] == e)
+                if not any: continue
+                gate_up = F.linear(x[mask], w1[e])
+                l, r   = gate_up.chunk(2, dim=-1)
+                act    = silu(l) * r
+                out_e  = F.linear(act, w2[e])
+                routed[mask] += out_e * token_weights[mask, k]
+        routed *= routed_scaling_factor                     # Step3.5: 3.0
+        if use_shared_expert:
+            shared, _ = shared_experts(hidden_states)        # Megatron's SharedExpertMLP
+            output = routed + shared.reshape(-1, H)
+        else:
+            output = routed
+        return output.reshape(S, B, H), None
+
+    Limitations (good enough for the current 1-GPU alignment run):
+      - EP = TP = ETP = 1 (no token-dispatch all-to-all; full token set on this rank).
+      - O(K * E * T) naive loop; alignment runs once, performance is irrelevant.
+      - aux-loss-free bias ignored (Step3.5 has ``router_bias_update_rate=0`` so
+        the bias stays at zero; if a checkpoint with non-zero bias is ever
+        loaded, this needs to be revisited).
+      - Step3.5 constants (``_routed_scaling_factor``, ``_use_sigmoid_router``,
+        ``_norm_expert_weight``) are class-level — adjust here if the recipe
+        ever changes.
+      - ``shared_experts`` is called as-is on the SBH tensor; its numerics must
+        already match SteptronOss ``FeedForward`` (which is the case once dense
+        MLP's linear_fc1/linear_fc2 are swapped to the ``_mlp`` debug variants).
+    """
+
+    _routed_scaling_factor: float = 3.0
+    _use_sigmoid_router: bool = True
+    _norm_expert_weight: bool = True
+
+    def _extract_expert_weights(self):
+        """Return ``(w1_list, w2_list)`` of length ``num_local_experts``.
+
+        Handles both expert backends Step3.5 may use:
+          - ``SequentialMLP``: ``experts.local_experts[i].linear_fc{1,2}.weight``
+          - ``TEGroupedMLP`` / ``GroupedMLP``: ``experts.linear_fc{1,2}.weight{i}``
+            (per-expert parameter names match ``StackedExpertAutoMapping``'s
+            ``weight*`` wildcard, see step35_bridge.py top).
+        """
+        num = self.experts.num_local_experts
+        if hasattr(self.experts, "local_experts"):
+            w1s = [e.linear_fc1.weight for e in self.experts.local_experts]
+            w2s = [e.linear_fc2.weight for e in self.experts.local_experts]
+            return w1s, w2s
+        fc1 = self.experts.linear_fc1
+        fc2 = self.experts.linear_fc2
+        if hasattr(fc1, "weight0"):
+            w1s = [getattr(fc1, f"weight{i}") for i in range(num)]
+            w2s = [getattr(fc2, f"weight{i}") for i in range(num)]
+            return w1s, w2s
+        raise RuntimeError(
+            f"MoELayer_debug cannot extract per-expert weights from "
+            f"experts={type(self.experts).__name__}; add a new branch in "
+            f"_extract_expert_weights."
+        )
+
+    def forward(self, hidden_states, **kwargs):  # noqa: D401
+        S, B, H = hidden_states.shape
+        in_dtype = hidden_states.dtype
+        x = hidden_states.reshape(-1, H)  # [T, H]
+        T = x.shape[0]
+        K = self.config.moe_router_topk
+        E = self.config.num_moe_experts
+
+        _layer_number = getattr(self, "layer_number", None)
+        assert _layer_number is not None, (
+            "MoELayer_debug.forward: self.layer_number is None. "
+            "TransformerLayer must assign layer_number (1-indexed within PP stage) "
+            "before MoELayer_debug runs — check that the MoE module is constructed "
+            "as part of TransformerLayer, not in isolation."
+        )
+        _layer_id = int(_layer_number) - 1
+        _prefix = f"layer_{_layer_id:03d}"
+
+        # ----- Router (SteptronOss MoEGate + forward_router) ------------------
+        router_logits = F.linear(x.float(), self.router.weight.float())  # [T, E]
+        if _prefix is not None:
+            _maybe_dump_moe_io(router_logits, f"{_prefix}_ffn_router_logits")
+
+        if self._use_sigmoid_router:
+            gate_prob = router_logits.sigmoid()
+        else:
+            gate_prob = router_logits.softmax(dim=-1)
+
+        # aux-loss-free balance bias: sort key only — does NOT enter weights.
+        expert_bias = getattr(self.router, "expert_bias", None)
+        if isinstance(expert_bias, torch.Tensor):
+            sort_key = gate_prob + expert_bias.to(gate_prob.dtype).unsqueeze(0)
+        else:
+            sort_key = gate_prob
+        _sorted_key, _sorted_idx = sort_key.sort(dim=-1, descending=True, stable=True)
+        topk_ids = _sorted_idx[:, :K].contiguous()       # [T, K]  int64
+        topk_prob = gate_prob.gather(1, topk_ids)        # [T, K]  fp32
+
+        token_weights = topk_prob
+        _has_bias = isinstance(expert_bias, torch.Tensor)
+        _eps = 1e-20 if _has_bias else 0.0
+        if self._use_sigmoid_router:
+            token_weights = token_weights / (token_weights.sum(dim=-1, keepdim=True) + _eps)
+        elif self._norm_expert_weight:
+            token_weights = token_weights / (topk_prob.sum(dim=-1, keepdim=True) + _eps)
+        if _prefix is not None:
+            _maybe_dump_moe_io(topk_ids, f"{_prefix}_ffn_router_topk_ids")
+            _maybe_dump_moe_io(token_weights, f"{_prefix}_ffn_router_topk_weights")
+
+        # ----- Routed experts (SteptronOss routed_grouped_ffn) -----------------
+        from steptronoss.model.utils.moe_utils import (
+            histogram as _st_histogram,
+            index_compute as _st_index_compute,
+            moe_scatter as _st_moe_scatter,
+            grouped_gemm as _st_grouped_gemm,
+            moe_weighted_gather as _st_moe_weighted_gather,
+        )
+
+        w1s, w2s = self._extract_expert_weights()
+        w1_stacked = torch.stack(w1s, dim=0)  # [E, 2F, H]
+        w2_stacked = torch.stack(w2s, dim=0)  # [E, H, F]
+
+        token_expert_ids = topk_ids
+        # Keep token_weights in fp32; MoEWeightedGather selects acc_dtype based on dtype.
+        token_weights_in = token_weights
+
+        if _prefix is not None:
+            _maybe_dump_moe_io(x, f"{_prefix}_ffn_experts_x_input")
+            _maybe_dump_moe_io(w1_stacked, f"{_prefix}_ffn_experts_w1")
+            _maybe_dump_moe_io(w2_stacked, f"{_prefix}_ffn_experts_w2")
+            _maybe_dump_moe_io(token_expert_ids, f"{_prefix}_ffn_experts_topk_ids_input")
+            _maybe_dump_moe_io(token_weights_in, f"{_prefix}_ffn_experts_topk_weights_input")
+
+        experts_histogram = _st_histogram(token_expert_ids, w1_stacked.shape[0])
+        if _prefix is not None:
+            _maybe_dump_moe_io(experts_histogram, f"{_prefix}_ffn_experts_histogram")
+
+        if experts_histogram.numel() == 0 or int(experts_histogram.sum().item()) == 0:
+            routed = x * token_weights_in.sum()
+        else:
+            batch_sizes = experts_histogram.long()
+            scatter_index = _st_index_compute(token_expert_ids, experts_histogram)
+            if _prefix is not None:
+                _maybe_dump_moe_io(scatter_index, f"{_prefix}_ffn_experts_scatter_index")
+
+            scattered = _st_moe_scatter(x, scatter_index)
+            if _prefix is not None:
+                _maybe_dump_moe_io(scattered, f"{_prefix}_ffn_experts_after_scatter")
+
+            gemm1_out = _st_grouped_gemm(scattered, w1_stacked, batch_sizes=batch_sizes, trans_b=True)
+            if _prefix is not None:
+                _maybe_dump_moe_io(gemm1_out, f"{_prefix}_ffn_experts_after_gemm1")
+
+            _routed_limit = _get_swiglu_limit(_layer_id, self.config.swiglu_limits)
+            print(f"for debug, layer_number: {_layer_id}, in MoELayer_debug.forward, _routed_limit is {_routed_limit}")
+            act_out = _swiglu_with_clip(gemm1_out, _routed_limit)
+            if _prefix is not None:
+                _maybe_dump_moe_io(act_out, f"{_prefix}_ffn_experts_after_act")
+
+            gemm2_out = _st_grouped_gemm(act_out, w2_stacked, batch_sizes=batch_sizes, trans_b=True)
+            if _prefix is not None:
+                _maybe_dump_moe_io(gemm2_out, f"{_prefix}_ffn_experts_after_gemm2")
+
+            routed = _st_moe_weighted_gather(gemm2_out, scatter_index, token_weights_in)
+
+        if _prefix is not None:
+            _maybe_dump_moe_io(routed, f"{_prefix}_ffn_experts_output")
+            _maybe_dump_moe_io(routed, f"{_prefix}_ffn_expert_out")
+
+        routed = routed * self._routed_scaling_factor
+        print(f"for debug, layer_number: {_layer_id}, in MoELayer_debug.forward, self._routed_scaling_factor is {self._routed_scaling_factor}")
+
+        if self.use_shared_expert and self.shared_experts is not None:
+            _shared_limit = _get_swiglu_limit(_layer_id, self.config.swiglu_limits_shared)
+            print(f"for debug, layer_number: {_layer_id}, in MoELayer_debug.forward, _shared_limit is {_shared_limit}")
+            if _shared_limit is not None:
+                print(
+                    f"[ALIGN][WARN] layer {_layer_id}: swiglu_limits_shared={_shared_limit} "
+                    f"but MoELayer_debug currently routes the shared expert through Megatron's "
+                    f"fused SharedExpertMLP without clip — numerical alignment with SteptronOss "
+                    f"will diverge on this layer. Reimplement the shared-expert forward inline "
+                    f"to apply _swiglu_with_clip before relying on this layer's dumps.",
+                    flush=True,
+                )
+            shared_out = self.shared_experts(hidden_states)
+            if _prefix is not None:
+                _maybe_dump_moe_io(shared_out, f"{_prefix}_ffn_shared_out")
+            output = routed.reshape(S, B, H) + shared_out
+        else:
+            output = routed.reshape(S, B, H)
+
+        return output, None
+
+
+def _format_spec(obj, indent=0):
+    """Recursively format ModuleSpec / dataclasses / lists / dicts with one-line-per-element indenting."""
+    import dataclasses
+
+    pad = "  " * indent
+    pad_inner = "  " * (indent + 1)
+
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        cls_name = type(obj).__name__
+        lines = [f"{cls_name}("]
+        for f in dataclasses.fields(obj):
+            v = getattr(obj, f.name)
+            lines.append(f"{pad_inner}{f.name}={_format_spec(v, indent + 1)},")
+        lines.append(f"{pad})")
+        return "\n".join(lines)
+
+    if isinstance(obj, (list, tuple)):
+        if not obj:
+            return "[]" if isinstance(obj, list) else "()"
+        open_b, close_b = ("[", "]") if isinstance(obj, list) else ("(", ")")
+        lines = [open_b]
+        for i, v in enumerate(obj):
+            lines.append(f"{pad_inner}[{i}] {_format_spec(v, indent + 1)},")
+        lines.append(f"{pad}{close_b}")
+        return "\n".join(lines)
+
+    if isinstance(obj, dict):
+        if not obj:
+            return "{}"
+        lines = ["{"]
+        for k, v in obj.items():
+            lines.append(f"{pad_inner}{k!r}: {_format_spec(v, indent + 1)},")
+        lines.append(f"{pad}}}")
+        return "\n".join(lines)
+
+    return repr(obj)
+
+
 def _build_step35_layer_spec(cfg, **kw):
     """Per-layer spec for Step3.5: dense for layers 0-2 and 45-47, MoE for 3-44.
 
@@ -598,6 +1001,39 @@ def _build_step35_layer_spec(cfg, **kw):
             _spec.submodules.self_attention.submodules.k_layernorm = TENorm_debug
             _spec.submodules.self_attention.submodules.core_attention = TEDotProductAttention_debug
             _spec.submodules.self_attention.submodules.linear_proj = TERowParallelLinear_debug
+
+            # MoE layers carry a standalone RMSNorm at pre_mlp_layernorm (Megatron's
+            # equivalent of SteptronOss's ffn_norm). Dense layers keep it as
+            # IdentityOp because the LN is fused into linear_fc1
+            # (TELayerNormColumnParallelLinear_debug_mlp). Replace the MoE-side
+            # RMSNorm with TENorm_debug_mlp so layer_NNN_ffn_norm matches
+            # SteptronOss bit-for-bit (fp32 normalize → cast bf16 → bf16 (γ+1)*y).
+            if _spec.submodules.pre_mlp_layernorm is not IdentityOp:
+                _spec.submodules.pre_mlp_layernorm = TENorm_debug_mlp
+
+            # Dense MLP swap (Step3.5 layers 0/1/2 + dense MTP spec). For dense layers
+            # the RMSNorm is fused into linear_fc1 (TELayerNormColumnParallelLinear,
+            # pre_mlp_layernorm is IdentityOp), so the layernorm-side alignment is
+            # done by replacing linear_fc1 with its _mlp debug variant. linear_fc2
+            # gets the gate-free row-parallel variant. MoE layer specs carry no
+            # ``linear_fc1`` field (they use router/experts/shared_experts), so the
+            # guard below silently skips them.
+            mlp_subs = getattr(_spec.submodules.mlp, "submodules", None)
+            if mlp_subs is not None and getattr(mlp_subs, "linear_fc1", None) is not None:
+                mlp_subs.linear_fc1 = TELayerNormColumnParallelLinear_debug_mlp
+                mlp_subs.linear_fc2 = TERowParallelLinear_debug_mlp
+
+            # MoE layer module swap (Step3.5 layers 3/4/5). MoELayer_debug subclasses
+            # MoELayer so __init__ still builds router/experts/shared_experts from
+            # the production submodules (no checkpoint changes), but forward is
+            # rewritten to mirror SteptronOss MoeShareExpertFFN+MoEBlock bit-for-bit.
+            # Identified by ``mlp.module is MoELayer`` (dense layers and the dense
+            # MTP spec use MLP and so are skipped).
+            if getattr(_spec.submodules.mlp, "module", None) is MoELayer:
+                _spec.submodules.mlp.module = MoELayer_debug
+
+    print(f"for debug, rank: {torch.distributed.get_rank()}, block_submodules:")
+    print(_format_spec(block_submodules, indent=1))
 
     return block_submodules
 
