@@ -13,15 +13,28 @@
 # limitations under the License.
 
 import logging
+import os
 from functools import partial
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
+import torch.nn.functional as F
+import transformer_engine.pytorch as te
+from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import (
+    TEDotProductAttention,
+    TELayerNormColumnParallelLinear,
+    TERowParallelLinear,
+    _get_extra_te_kwargs,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
+from megatron.core.transformer.enums import AttnMaskType
 from transformers import AutoConfig
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
@@ -133,6 +146,416 @@ class _MTPDenseLayerSpecsList(list):
         return super().__getitem__(idx)
 
 
+class TELayerNormColumnParallelLinear_debug(TELayerNormColumnParallelLinear):
+    """Bit-for-bit reference of SteptronOss's ``attention_norm`` (RMSNorm) + ``wqkv`` (ColumnParallelLinear).
+
+    Inherits parameter init, TP sharding, and sharded_state_dict from TE so the checkpoint stays
+    compatible with the production class — only ``forward`` is replaced with the explicit fp32-norm /
+    bf16-multiply / no-bias-linear sequence used by SteptronOss/RMSNorm so the two stacks produce
+    identical activations down to the last bit.
+
+    Reference: SteptronOss ``rms_norm.py`` (``rms_foward`` + ``RMSNorm.forward``):
+        l2 = rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-5)
+        y  = (x.float() * l2).type_as(x)
+        return y * (weight + 1.0)        # use_zero_init=True ⇒ bias=1
+    followed by ``ColumnParallelLinear`` with ``bias=False, gather_output=False``.
+    """
+
+    def forward(self, x):
+        in_dtype = x.dtype
+        x_fp32 = x.float()
+        l2_norm_inv = torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.config.layernorm_epsilon)
+        y = (x_fp32 * l2_norm_inv).to(in_dtype)
+
+        ln_weight = self.layer_norm_weight
+        if self.config.layernorm_zero_centered_gamma:
+            ln_weight = ln_weight + 1.0
+
+        ln_output = y * ln_weight
+        out_hidden = torch.nn.functional.linear(ln_output, self.weight)
+
+        ret_bias = None
+        ret_ln_output = ln_output  # always return the ln_output
+        return out_hidden, ret_bias, ret_ln_output
+
+
+class TENorm_debug(te.RMSNorm):
+    """Bit-for-bit reference of SteptronOss's ``q_norm`` / ``k_norm`` (RMSNorm over head_dim).
+
+    Inherits parameter init / naming / sharded_state_dict from ``te.pytorch.RMSNorm`` (which is what
+    ``TENorm`` builds in production for Step3.5's RMSNorm) so checkpoints stay compatible — only
+    ``forward`` is replaced with the explicit fp32-norm / +1-gamma / fp32-multiply / cast-back
+    sequence SteptronOss uses, so the two stacks produce identical qnorm/knorm outputs.
+
+    Reference: SteptronOss ``rms_norm.py:55-62`` (``RMSNorm.forward``):
+        weight = self.weight + self.bias   # bias == 1 when use_zero_init=True
+        y = RMSNormFunction.apply(x.float()).type_as(x)
+        return y * weight
+    where ``RMSNormFunction.forward = x * rsqrt(x.pow(2).mean(-1) + 1e-5)``.
+
+    The diff against stock TENorm/te.RMSNorm: TE's RMSNorm runs the multiply in input dtype (bf16),
+    SteptronOss runs the entire normalization in fp32 and casts only the final ``y`` back.
+    """
+
+    def __init__(self, config, hidden_size: int, eps: float = 1e-5):
+        super().__init__(
+            normalized_shape=hidden_size,
+            eps=eps,
+            sequence_parallel=config.sequence_parallel,
+            zero_centered_gamma=config.layernorm_zero_centered_gamma,
+            **_get_extra_te_kwargs(config),
+        )
+        self.config = config
+        self.eps_value = eps
+
+    def forward(self, x):
+        # Match SteptronOss ``RMSNorm.forward`` (rms_norm.py:55-62) bit-for-bit:
+        #   y = RMSNormFunction.apply(x.float()).type_as(x)   # fp32 normalize → immediate cast back
+        #   return y * (self.weight + self.bias)              # bf16 multiply (bias=1 when use_zero_init)
+        # i.e. RMS normalize runs in fp32 but the `(γ+1) * y` multiply runs in bf16.
+        in_dtype = x.dtype
+        x_fp32 = x.float()
+        l2_norm_inv = torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps_value)
+        y = (x_fp32 * l2_norm_inv).to(in_dtype)
+
+        weight = self.weight
+        if self.config.layernorm_zero_centered_gamma:
+            weight = weight + 1.0
+
+        return y * weight
+
+
+class TERowParallelLinear_debug(TERowParallelLinear):
+    """Bit-for-bit reference of SteptronOss's ``wo`` (RowParallelLinear, bias=False).
+
+    Inherits parameter init, TP sharding, and sharded_state_dict from TE so the checkpoint
+    stays compatible with the production class — only ``forward`` is replaced with the
+    explicit no-bias ``F.linear`` + TP all-reduce sequence used by SteptronOss
+    ``RowParallelLinear`` so the two stacks produce identical ``linear_proj`` outputs down
+    to the last bit.
+
+    Reference: SteptronOss ``layers.py`` (``RowParallelLinear.forward``) +
+    ``grouped_query_attention.py`` (``head_wise_attn_gate_function``):
+        # input_is_parallel=True, bias=False, no sequence parallel.
+        # head_wise_attn_gate is folded into the GEMM input via custom_pre_recompute_function.
+        if gate is not None:
+            attn_out = input.view(S, B, num_local_heads, head_dim)
+            input    = (attn_out * gate.unsqueeze(-1).sigmoid()).view(S, B, -1)
+        output_parallel = F.linear(input, self.weight)            # no bias add
+        output          = reduce_from_tensor_model_parallel_region(output_parallel)
+        return output, None
+
+    Head-wise gate flow (A2 alignment):
+        ``SelfAttention.forward`` checks ``self.linear_proj._apply_head_wise_gate_internally``;
+        when True it skips the outer gate apply and instead assigns
+        ``self.linear_proj._pending_head_wise_gate = head_wise_gate``. We read and clear that
+        attribute on the next forward, then apply ``out * sigmoid(gate)`` exactly as the
+        original attention.py block did (fp32 sigmoid → cast back to input dtype) — this
+        keeps Megatron's gate semantics unchanged while moving the apply site *inside*
+        linear_proj so the ``attention_preproj`` input hook captures the **pre-gate**
+        tensor, matching SteptronOss's ``wo`` input hook bit-for-bit at the same
+        semantic point.
+
+    Notes:
+        - Step3.5 sets ``bias=False`` on this layer, so we ignore ``self.bias`` entirely.
+        - Sequence-parallel reduce-scatter is not implemented; the alignment runs use
+          ``model.sequence_parallel=False``.
+    """
+
+    # Read by SelfAttention.forward: when True, attention.py skips its outer
+    # head_wise_gate apply and forwards the gate tensor via attribute injection
+    # so this class can apply it inside the forward — see class docstring.
+    _apply_head_wise_gate_internally = True
+
+    def forward(self, x):
+        # Pop the gate injected by SelfAttention.forward (if any) and apply it
+        # using bf16 sigmoid to match SteptronOss head_wise_attn_gate_function
+        # bit-for-bit. (Megatron's original attention.py block runs sigmoid in
+        # fp32 then casts back; SteptronOss runs sigmoid directly in the gate's
+        # native dtype — typically bf16. We follow SteptronOss here.)
+        gate = getattr(self, "_pending_head_wise_gate", None)
+        if gate is not None:
+            self._pending_head_wise_gate = None
+            gate_states = gate.view(*gate.shape[:2], -1, 1)
+            x = x.view(*gate_states.shape[:3], -1)
+            x = x * gate_states.sigmoid()
+            x = x.view(*gate_states.shape[:2], -1)
+
+        output_parallel = torch.nn.functional.linear(x, self.weight)
+        output = reduce_from_tensor_model_parallel_region(output_parallel, group=self._tp_group)
+        return output, None
+
+
+@torch._dynamo.disable
+def _maybe_save_sdpa_io(
+    module,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask,
+    is_causal: bool,
+    dropout_p: float,
+    out: torch.Tensor,
+) -> None:
+    """Dump SDPA inputs/output to ``MBRIDGE_SAVE_INTERMEDIATE_PATH`` for cross-framework diff.
+
+    Files (per (layer, sdpa-call)):
+        layer_NNN_attention_core_sdpa_callC_{q,k,v,output}.pt   tensors
+        layer_NNN_attention_core_sdpa_callC_mask.pt             only when attn_mask is a Tensor
+        layer_NNN_attention_core_sdpa_callC_meta.pt             dict with is_causal, dropout_p, shapes, dtypes
+
+    Idempotent: existing files are not overwritten so backward recompute / multi-iter runs
+    don't pollute the dump. ``module.layer_number`` is inherited from TEDotProductAttention
+    (1-indexed); we save as ``(layer_number - 1)``.
+    """
+    # Fine-grained dump: gated by DUMP_FINEGRAIN so DUMP_BLOCK_IO-only runs
+    # skip per-SDPA-call I/O (kept on by default for backwards compatibility).
+    if os.environ.get("DUMP_FINEGRAIN", "1") != "1":
+        return
+    save_dir = os.environ.get("MBRIDGE_SAVE_INTERMEDIATE_PATH")
+    if not save_dir:
+        return
+    # MBRIDGE_DUMP_PP_RANK0_ONLY=1 (default) limits the dump to PP rank 0 so
+    # one PP stage can be aligned at a time. Set to 0 to dump on all PP ranks.
+    if os.environ.get("MBRIDGE_DUMP_PP_RANK0_ONLY", "1") == "1":
+        if parallel_state.get_pipeline_model_parallel_rank() != 0:
+            return
+    layer_number = getattr(module, "layer_number", None)
+    if layer_number is None:
+        return
+    layer_id = int(layer_number) - 1
+
+    call_idx = getattr(module, "_sdpa_call_counter", 0)
+    module._sdpa_call_counter = call_idx + 1
+
+    os.makedirs(save_dir, exist_ok=True)
+    prefix = f"layer_{layer_id:03d}_attention_core_sdpa_call{call_idx}"
+
+    def _save(tensor, name):
+        path = os.path.join(save_dir, f"{prefix}_{name}.pt")
+        if os.path.exists(path):
+            print(
+                f"[ALIGN] sdpa_io skip {prefix}_{name} (file already exists, expected with multi-rank): {path}",
+                flush=True,
+            )
+            return
+        torch.save(tensor.detach().cpu(), path)
+        tf = tensor.detach().float()
+        print(
+            f"[ALIGN] sdpa_io saved {prefix}_{name}: shape={tuple(tensor.shape)}, dtype={tensor.dtype}",
+            flush=True,
+        )
+        print(
+            f"[ALIGN] sdpa_io stats {prefix}_{name}: min={tf.min():.6f}  max={tf.max():.6f}  mean={tf.mean():.6f}  std={tf.std():.6f}",
+            flush=True,
+        )
+        print(f"[ALIGN] sdpa_io {prefix}_{name}: {tensor}", flush=True)
+
+    _save(q, "q")
+    _save(k, "k")
+    _save(v, "v")
+    if isinstance(attn_mask, torch.Tensor):
+        _save(attn_mask, "mask")
+    _save(out, "output")
+
+    meta_path = os.path.join(save_dir, f"{prefix}_meta.pt")
+    if not os.path.exists(meta_path):
+        meta = {
+            "is_causal": bool(is_causal),
+            "dropout_p": float(dropout_p),
+            "attn_mask_is_none": attn_mask is None,
+            "attn_mask_dtype": str(attn_mask.dtype) if isinstance(attn_mask, torch.Tensor) else None,
+            "attn_mask_shape": tuple(attn_mask.shape) if isinstance(attn_mask, torch.Tensor) else None,
+            "q_shape": tuple(q.shape), "q_dtype": str(q.dtype),
+            "k_shape": tuple(k.shape), "k_dtype": str(k.dtype),
+            "v_shape": tuple(v.shape), "v_dtype": str(v.dtype),
+            "out_shape": tuple(out.shape), "out_dtype": str(out.dtype),
+        }
+        torch.save(meta, meta_path)
+        print(f"[ALIGN] sdpa_io meta {prefix}: {meta}", flush=True)
+
+
+class TEDotProductAttention_debug(TEDotProductAttention):
+    """Bit-for-bit reference of SteptronOss ``AttentionCore.forward`` (PyTorch SDPA).
+
+    Inherits TEDotProductAttention so layer construction (init args, CP/TP wiring,
+    qk-clip stats) stays unchanged — only ``forward`` is replaced with the explicit
+    SDPA sequence used by SteptronOss ``attention_core.py`` so the two stacks produce
+    identical attention outputs.
+
+    Reference (SteptronOss ``AttentionCore.forward``, attention_core.py:334-400):
+      1. q,k,v come in BSHD; GQA-expand k/v along head dim via repeat_interleave;
+      2. transpose to BHSD; call ``F.scaled_dot_product_attention`` with
+         ``is_causal=self.causal and not use_mask`` (use_mask iff window>=0);
+      3. transpose back to BSHD.
+
+    Megatron passes q/k/v in sbhd (non-packed) or thd (packed) layout, so this
+    wrapper handles the layout conversions before delegating to the same SDPA
+    call. Returned tensor matches the original TEDotProductAttention output:
+      - sbhd: [s, b, np_q * hn]
+      - thd : [t, np_q * hn]
+
+    Limitations (intentional, expand if needed):
+      - ``attention_bias`` is not supported (Step3.5 doesn't use it).
+      - ``num_splits`` is not supported (TE-specific kernel flag).
+      - SWA (window_size > 0) builds an explicit boolean mask just like SteptronOss.
+    """
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        num_splits: Optional[int] = None,
+    ) -> torch.Tensor:
+        assert attention_bias is None, "TEDotProductAttention_debug does not support attention_bias"
+        assert num_splits is None, "TEDotProductAttention_debug does not support num_splits"
+
+        # Reset per-forward sdpa call counter so dumps are idempotent across
+        # forward/backward recompute and multi-iter runs.
+        self._sdpa_call_counter = 0
+
+        causal = attn_mask_type in (
+            AttnMaskType.causal,
+            AttnMaskType.padding_causal,
+            AttnMaskType.causal_bottom_right,
+        )
+
+        # Per-layer SWA gating: ``self.config.window_size`` is a single global
+        # value (e.g. [512, 0]) shared across all layers, but Step3.5 only wants
+        # it on layers explicitly marked sliding. ``Step35DecoderLayer`` exposes
+        # the resolved global 0-indexed layer_idx as ``self._layer_idx`` so we
+        # can look up ``config.layer_types[layer_idx] == "sliding_attention"``.
+        # If the layer is not SWA (or layer_idx is unavailable), force window=-1
+        # so use_mask=False and SDPA falls back to the pure causal kernel.
+        layer_idx = getattr(self, "_layer_idx", None)
+        layer_types = getattr(self.config, "layer_types", None) or []
+        is_swa_layer = (
+            layer_idx is not None
+            and 0 <= layer_idx < len(layer_types)
+            and layer_types[layer_idx] == "sliding_attention"
+        )
+
+        if is_swa_layer:
+            # SteptronOss sliding_window: -1 disables, >=0 enables (window on each side).
+            # Megatron stores window as (left, right). Use the left window
+            # (Step3.5 SWA is symmetric causal so right=0, left=W).
+            window_size = getattr(self.config, "window_size", None)
+            if isinstance(window_size, (list, tuple)) and len(window_size) >= 1:
+                window = int(window_size[0])
+            elif isinstance(window_size, int):
+                window = int(window_size)
+            else:
+                window = -1
+        else:
+            window = -1
+        use_mask = window >= 0
+
+        if packed_seq_params is not None and getattr(packed_seq_params, "qkv_format", None) == "thd":
+            return self._forward_thd(query, key, value, packed_seq_params, causal=causal, window=window, use_mask=use_mask)
+        return self._forward_sbhd(query, key, value, causal=causal, window=window, use_mask=use_mask)
+
+    @staticmethod
+    def _expand_kv(k: torch.Tensor, v: torch.Tensor, np_q: int) -> tuple[torch.Tensor, torch.Tensor]:
+        np_kv = k.shape[-2]
+        if np_kv == np_q:
+            return k, v
+        assert np_q % np_kv == 0, f"np_q ({np_q}) must be divisible by np_kv ({np_kv})"
+        repeat = np_q // np_kv
+        return k.repeat_interleave(repeat, dim=-2), v.repeat_interleave(repeat, dim=-2)
+
+    @staticmethod
+    def _build_local_mask(q_len: int, k_len: int, window: int, causal: bool, device) -> torch.Tensor:
+        # Match SteptronOss AttentionCore._build_local_mask bit-for-bit.
+        q_idx = torch.arange(q_len, device=device).unsqueeze(1)
+        k_idx = torch.arange(k_len, device=device).unsqueeze(0)
+        if window < 0:
+            allowed = k_idx <= q_idx if causal else torch.ones((q_len, k_len), dtype=torch.bool, device=device)
+        else:
+            if causal:
+                allowed = (k_idx <= q_idx) & (k_idx >= (q_idx - window))
+            else:
+                allowed = (k_idx - q_idx).abs() <= window
+        return allowed
+
+    def _sdpa(self, q, k, v, *, is_causal: bool, attn_mask):
+        # q/k/v: [b, h, s, d]
+        dropout_p = self.config.attention_dropout if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+        )
+        _maybe_save_sdpa_io(self, q, k, v, attn_mask, is_causal, dropout_p, out)
+        return out
+
+    def _forward_sbhd(self, query, key, value, *, causal: bool, window: int, use_mask: bool):
+        # query/key/value: [s, b, np, hn]
+        s_q, b, np_q, hn = query.shape
+        s_k = key.shape[0]
+
+        # → [b, s, np, hn]
+        q = query.transpose(0, 1)
+        k = key.transpose(0, 1)
+        v = value.transpose(0, 1)
+        k, v = self._expand_kv(k, v, np_q)
+
+        # → [b, h, s, d] for SDPA
+        q_t = q.transpose(1, 2)
+        k_t = k.transpose(1, 2)
+        v_t = v.transpose(1, 2)
+
+        is_causal = causal and not use_mask
+        attn_mask = None
+        if use_mask:
+            mask = self._build_local_mask(s_q, s_k, window, causal, device=q_t.device)
+            attn_mask = mask.unsqueeze(0).unsqueeze(0)
+
+        out = self._sdpa(q_t, k_t, v_t, is_causal=is_causal, attn_mask=attn_mask)
+        # out: [b, h, s, d] → [s, b, h*d]
+        out = out.transpose(1, 2).contiguous()  # [b, s, h, d]
+        out = out.transpose(0, 1).contiguous()  # [s, b, h, d]
+        return out.reshape(s_q, b, np_q * hn)
+
+    def _forward_thd(self, query, key, value, packed_seq_params, *, causal: bool, window: int, use_mask: bool):
+        # query/key/value: [t, np, hn]
+        t_q, np_q, hn = query.shape
+        cu_q = packed_seq_params.cu_seqlens_q
+        cu_kv = packed_seq_params.cu_seqlens_kv
+        if cu_q is None or cu_kv is None:
+            raise RuntimeError("TEDotProductAttention_debug thd path requires cu_seqlens_q/cu_seqlens_kv")
+        cu_q = cu_q.to(torch.int32)
+        cu_kv = cu_kv.to(torch.int32)
+
+        k, v = self._expand_kv(key, value, np_q)
+
+        q_cu = cu_q.tolist()
+        k_cu = cu_kv.tolist()
+        outputs = []
+        for b_idx in range(len(q_cu) - 1):
+            q_start, q_end = q_cu[b_idx], q_cu[b_idx + 1]
+            k_start, k_end = k_cu[b_idx], k_cu[b_idx + 1]
+            q_seq = query[q_start:q_end].transpose(0, 1).unsqueeze(0)  # [1, h, q, d]
+            k_seq = k[k_start:k_end].transpose(0, 1).unsqueeze(0)
+            v_seq = v[k_start:k_end].transpose(0, 1).unsqueeze(0)
+
+            is_causal = causal and not use_mask
+            attn_mask = None
+            if use_mask:
+                mask = self._build_local_mask(q_seq.shape[-2], k_seq.shape[-2], window, causal, device=q_seq.device)
+                attn_mask = mask.unsqueeze(0).unsqueeze(0)
+            out = self._sdpa(q_seq, k_seq, v_seq, is_causal=is_causal, attn_mask=attn_mask)
+            outputs.append(out.squeeze(0).transpose(0, 1))  # [q, h, d]
+
+        out = torch.cat(outputs, dim=0)  # [t, h, d]
+        return out.reshape(t_q, np_q * hn)
+
+
 def _build_step35_layer_spec(cfg, **kw):
     """Per-layer spec for Step3.5: dense for layers 0-2 and 45-47, MoE for 3-44.
 
@@ -167,6 +590,14 @@ def _build_step35_layer_spec(cfg, **kw):
     )
     dense_mtp_spec.module = Step35DecoderLayer
     block_submodules.layer_specs = _MTPDenseLayerSpecsList(block_submodules.layer_specs, dense_mtp_spec)
+
+    if os.environ.get("USE_DEBUG_SUBMODULE", "0") == "1":
+        for _spec in list(block_submodules.layer_specs) + [dense_mtp_spec]:
+            _spec.submodules.self_attention.submodules.linear_qkv = TELayerNormColumnParallelLinear_debug
+            _spec.submodules.self_attention.submodules.q_layernorm = TENorm_debug
+            _spec.submodules.self_attention.submodules.k_layernorm = TENorm_debug
+            _spec.submodules.self_attention.submodules.core_attention = TEDotProductAttention_debug
+            _spec.submodules.self_attention.submodules.linear_proj = TERowParallelLinear_debug
 
     return block_submodules
 

@@ -129,6 +129,7 @@ class Step35DecoderLayer(TransformerLayer):
         if 0 <= layer_idx < len(swiglu_limits_shared):
             v = swiglu_limits_shared[layer_idx]
             config.activation_func_clamp_value_shared_expert = None if (v is None or float(v) == 0.0) else float(v)
+        print(f"for debug, layer_idx: {layer_idx}, is_sliding: {is_sliding}, config.window_size: {config.window_size}, config.num_attention_heads: {config.num_attention_heads}, config.num_query_groups: {config.num_query_groups}, config.kv_channels: {config.kv_channels}")
         super().__init__(
             config=config,
             submodules=submodules,

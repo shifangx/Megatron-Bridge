@@ -1138,13 +1138,19 @@ def _forward_step_common(
             _maybe_print_model_structure(model)
             # ===== ALIGNMENT: register intermediate activation hooks =====
             _intermediate_dir = os.environ.get("MBRIDGE_SAVE_INTERMEDIATE_PATH", "")
+            # MBRIDGE_DUMP_PP_RANK0_ONLY=1 (default) restricts the intermediate-activation
+            # dump to PP rank 0 — useful while aligning one PP stage at a time.
+            # Set to 0 once PP0 is matched to enable dumps on all PP stages.
+            _dump_pp_rank0_only = os.environ.get("MBRIDGE_DUMP_PP_RANK0_ONLY", "1") == "1"
+            _pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+            _dump_enabled = bool(_intermediate_dir) and (not _dump_pp_rank0_only or _pp_rank == 0)
             if _intermediate_dir:
                 print(
-                    f"[ALIGN] [rank={torch.distributed.get_rank()}] registering intermediate activation hooks"
+                    f"[ALIGN] [rank={torch.distributed.get_rank()} pp_rank={_pp_rank}] "
+                    f"intermediate activation hooks: "
+                    f"{'registering' if _dump_enabled else 'SKIP (MBRIDGE_DUMP_PP_RANK0_ONLY=1)'}"
                 )
-            # Every rank registers and writes its own dumps; the DUMP_BLOCK_IO /
-            # DUMP_FINEGRAIN / DUMP_LMHEAD switches are the only gates.
-            _ihooks = _build_intermediate_hooks(model, _intermediate_dir) if _intermediate_dir else []
+            _ihooks = _build_intermediate_hooks(model, _intermediate_dir) if _dump_enabled else []
             # ===== END ALIGNMENT =====
             output_tensor = model(**forward_args)
             # ===== ALIGNMENT: remove intermediate hooks =====
