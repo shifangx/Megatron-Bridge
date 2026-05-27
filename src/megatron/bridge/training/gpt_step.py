@@ -729,8 +729,11 @@ def _build_intermediate_hooks(model: GPTModel, save_dir: str) -> list:
     decoder = getattr(gpt_model, "decoder", None) or getattr(gpt_model, "encoder", None)
     if decoder is not None and hasattr(decoder, "layers"):
         for i, layer in enumerate(decoder.layers):
-            layer_number = layer.layer_number
-            layer_idx = layer_number - 1
+            # Prefer the global 0-indexed layer id set by Step35DecoderLayer
+            # (``layer.layer_number`` is per-PP-rank 1-based, so with PP>1 the
+            # naive ``layer_number - 1`` collides across stages and later ranks
+            # see "file already exists" and skip).
+            layer_idx = getattr(layer, "_layer_idx", layer.layer_number - 1)
             if dump_finegrain and getattr(layer, "pre_mlp_layernorm", None) is not None and not isinstance(
                 layer.pre_mlp_layernorm, torch.nn.Identity
             ):
