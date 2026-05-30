@@ -258,6 +258,11 @@ def _process_default_inputs(processor, image_path, prompt):
         padding=True,
         return_tensors="pt",
     )
+    rank = torch.distributed.get_rank()
+    if rank == 0:
+        print(f"for debug, rank {rank}, type(inputs): {type(inputs)}", flush=True)
+        print(f"for debug, rank {rank}, inputs.keys(): {list(inputs.keys())}", flush=True)
+        print(f"for debug, rank {rank}, inputs: {inputs}", flush=True)
     return (
         inputs.input_ids,
         inputs.get("pixel_values"),

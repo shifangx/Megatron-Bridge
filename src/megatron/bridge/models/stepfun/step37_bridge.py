@@ -299,6 +299,26 @@ class Step37Bridge(MegatronModelBridge):
         # cache to the full Step-3.5 262144-position window.
         provider.language_max_sequence_length = int(getattr(text_config, "max_position_embeddings", 262144))
 
+        # for debug, change num_layers to 6
+        num_layers = 6
+        provider.num_layers = num_layers
+        total_layers = provider.num_layers + provider.mtp_num_layers
+        provider.rotary_base_per_layer = provider.rotary_base_per_layer[:total_layers]
+        provider.layer_types = provider.layer_types[:total_layers]
+        provider.swiglu_limits = provider.swiglu_limits[:total_layers]
+        provider.swiglu_limits_shared = provider.swiglu_limits_shared[:total_layers]
+        provider.rotary_percents = provider.rotary_percents[:total_layers]
+        provider.moe_layer_freq = provider.moe_layer_freq[:num_layers]
+        
+        # Debug: print provider and hf_config on rank 0 (one element per line).
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            print("===== Step37Bridge hf_config =====", flush=True)
+            for _k, _v in sorted(vars(hf_config).items()):
+                print(f"  hf_config.{_k} = {_v}", flush=True)
+            print("===== Step37Bridge provider =====", flush=True)
+            for _k, _v in sorted(vars(provider).items()):
+                print(f"  provider.{_k} = {_v}", flush=True)
+
         return provider
 
     def mapping_registry(self) -> MegatronMappingRegistry:

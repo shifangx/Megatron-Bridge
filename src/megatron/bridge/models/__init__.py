@@ -53,13 +53,13 @@ from megatron.bridge.models.glm import (
     GLM45Bridge,
     GLM47FlashBridge,
 )
-from megatron.bridge.models.glm_moe_dsa import (
-    GLM5Bridge,
-)
-from megatron.bridge.models.glm_vl import (
-    GLM45VBridge,
-    GLM45VModelProvider,
-)
+# from megatron.bridge.models.glm_moe_dsa import (
+#     GLM5Bridge,
+# )
+# from megatron.bridge.models.glm_vl import (
+#     GLM45VBridge,
+#     GLM45VModelProvider,
+# )
 from megatron.bridge.models.gpt_oss import (
     GPTOSSBridge,
 )

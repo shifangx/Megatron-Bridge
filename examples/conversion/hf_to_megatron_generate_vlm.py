@@ -158,6 +158,11 @@ def main(args) -> None:
         image_token_id = 163605
     is_gemma4 = "gemma4" in model_type
 
+    # # Debug: print config on rank 0 (one element per line).
+    # print_rank_0(f"===== AutoConfig.from_pretrained config(type: {type(config)}) =====")
+    # for _k, _v in sorted(vars(config).items()):
+    #     print_rank_0(f"  config.{_k} = {_v}")    
+
     # ------------------------------------------------------------------
     # Load model
     # ------------------------------------------------------------------
@@ -203,6 +208,9 @@ def main(args) -> None:
         model_provider.initialize_model_parallel(seed=0)
         model = model_provider.provide_distributed_model(wrap_with_ddp=False)
 
+    rank = torch.distributed.get_rank()
+    if rank == 0:
+        print(f"for debug, rank {rank}, before disable mtp, model: {model}", flush=True)
     def _disable_mtp(m):
         m.config.mtp_num_layers = None
         inner = m.module if hasattr(m, "module") else m
@@ -217,6 +225,8 @@ def main(args) -> None:
         if hasattr(m, "config"):
             m.config.grad_scale_func = None
 
+    if rank == 0:
+        print(f"for debug, rank {rank}, after disable mtp, model: {model}", flush=True)
     # ------------------------------------------------------------------
     # Tokenizer & processor
     # ------------------------------------------------------------------
