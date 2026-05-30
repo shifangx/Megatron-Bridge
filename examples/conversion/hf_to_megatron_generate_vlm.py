@@ -34,6 +34,14 @@ import torch.distributed as dist
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+from step37_vlm_utils import (
+    Step37BatchIterator,
+    build_step37_images,
+    build_step37_packed_seq_params,
+    pad_step37_input_ids,
+    process_step37_inputs,
+    step37_vlm_forward_step,
+)
 from vlm_generate_utils import (
     pad_input_ids_to_tp_multiple,
     patch_kimi_vision_processor,
@@ -157,6 +165,10 @@ def main(args) -> None:
     if is_kimi and image_token_id is None:
         image_token_id = 163605
     is_gemma4 = "gemma4" in model_type
+    # Step3.7 (model_type="step3p7") needs a dedicated input/forward adapter:
+    # its forward consumes images: list[ImageForInsert] + packed_seq_params,
+    # not the HF-generic pixel_values keys. See step37_vlm_utils.
+    is_step37 = "step3" in model_type
 
     # # Debug: print config on rank 0 (one element per line).
     # print_rank_0(f"===== AutoConfig.from_pretrained config(type: {type(config)}) =====")
@@ -243,8 +255,15 @@ def main(args) -> None:
     # ------------------------------------------------------------------
     pixel_values = image_grid_thw = image_sizes = mm_token_type_ids = image_position_ids = None
     pixel_values_videos = video_grid_thw = None
+    step37_images = None
 
-    if args.video_path:
+    if is_step37:
+        # Step3.7: keep the full Step3VLProcessor output and pre-build the
+        # list[ImageForInsert] consumed by Step37Model.forward.
+        s37_inputs = process_step37_inputs(processor, args.image_path, args.prompt)
+        input_ids_raw = s37_inputs["input_ids"]
+        step37_images = build_step37_images(s37_inputs, tokenizer)
+    elif args.video_path:
         input_ids_raw, pixel_values_videos, video_grid_thw = process_video_inputs(
             processor, args.video_path, args.prompt, fps=args.video_fps
         )
@@ -289,34 +308,49 @@ def main(args) -> None:
             print_rank_0(f"Generation step {step}")
 
             real_seq_len = generated_ids.size(1)
-            input_ids = pad_input_ids_to_tp_multiple(generated_ids, tp, pad_token_id)
-
-            mm_ids_padded = None
-            if mm_token_type_ids is not None:
-                mm_ids_padded = pad_input_ids_to_tp_multiple(mm_token_type_ids, tp, 0)
-
-            position_ids = (
-                torch.arange(input_ids.size(1), dtype=torch.long, device=input_ids.device)
-                .unsqueeze(0)
-                .expand_as(input_ids)
-            )
 
             fwd_bwd_function = get_forward_backward_func()
-            iterator = SingleBatchIterator(
-                input_ids,
-                position_ids,
-                None,
-                pixel_values,
-                image_grid_thw,
-                image_sizes,
-                mm_ids_padded,
-                pixel_values_videos=pixel_values_videos,
-                video_grid_thw=video_grid_thw,
-                image_position_ids=image_position_ids,
-            )
+            if is_step37:
+                # Pad to lcm(tp,16) for TE/FP8; build packed_seq_params + carry
+                # the pre-built images. Vision re-runs each step (no KV cache),
+                # which is fine — the <im_start> placeholders stay at the front
+                # of the growing sequence, so images must be passed every step.
+                input_ids, _real_len, padded_len = pad_step37_input_ids(generated_ids, tp, pad_token_id)
+                packed_seq_params = build_step37_packed_seq_params(
+                    real_seq_len, padded_len, input_ids.device
+                )
+                attention_mask = torch.ones(input_ids.shape, dtype=torch.bool, device=input_ids.device)
+                iterator = Step37BatchIterator(input_ids, step37_images, packed_seq_params, attention_mask)
+                forward_step_func = step37_vlm_forward_step
+            else:
+                input_ids = pad_input_ids_to_tp_multiple(generated_ids, tp, pad_token_id)
+
+                mm_ids_padded = None
+                if mm_token_type_ids is not None:
+                    mm_ids_padded = pad_input_ids_to_tp_multiple(mm_token_type_ids, tp, 0)
+
+                position_ids = (
+                    torch.arange(input_ids.size(1), dtype=torch.long, device=input_ids.device)
+                    .unsqueeze(0)
+                    .expand_as(input_ids)
+                )
+
+                iterator = SingleBatchIterator(
+                    input_ids,
+                    position_ids,
+                    None,
+                    pixel_values,
+                    image_grid_thw,
+                    image_sizes,
+                    mm_ids_padded,
+                    pixel_values_videos=pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
+                    image_position_ids=image_position_ids,
+                )
+                forward_step_func = vlm_forward_step
 
             output = fwd_bwd_function(
-                forward_step_func=vlm_forward_step,
+                forward_step_func=forward_step_func,
                 data_iterator=iterator,
                 model=model,
                 num_microbatches=1,
