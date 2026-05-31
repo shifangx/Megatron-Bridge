@@ -219,8 +219,9 @@ def process_image_inputs(
         raise ImportError(
             "qwen_vl_utils is required for non-Kimi VLM image processing. Install it with: pip install qwen-vl-utils"
         )
-    return _process_default_inputs(processor, image_path, prompt)
-
+    inputs = _process_default_inputs(processor, image_path, prompt)
+    print(f"for debug, in _process_image_inputs, inputs: {inputs}", flush=True)
+    return inputs
 
 def _process_kimi_inputs(processor, image_path, prompt, image_token_id):
     messages = [
@@ -262,6 +263,8 @@ def _process_default_inputs(processor, image_path, prompt):
     if rank == 0:
         print(f"for debug, rank {rank}, type(inputs): {type(inputs)}", flush=True)
         print(f"for debug, rank {rank}, inputs.keys(): {list(inputs.keys())}", flush=True)
+        pixel_values = inputs.get("pixel_values")
+        print(f"for debug, rank {rank}, pixel_values: {pixel_values}", flush=True)
         print(f"for debug, rank {rank}, inputs: {inputs}", flush=True)
     return (
         inputs.input_ids,

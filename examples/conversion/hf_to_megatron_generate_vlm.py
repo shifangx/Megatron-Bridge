@@ -28,6 +28,9 @@ Example:
 """
 
 import argparse
+import json
+import os
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -54,6 +57,43 @@ from vlm_generate_utils import (
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
 from megatron.bridge.utils.common_utils import get_last_rank, print_rank_0, print_rank_last
+
+
+# ---------------------------------------------------------------------------
+# Dump helpers (mirror Scripts-MBridge/transformers_step37.py so the Megatron
+# side produces comparable artifacts under DUMP_DIR).
+# ---------------------------------------------------------------------------
+
+
+def tensor_summary(t, num_values=8):
+    """Describe a tensor: shape, dtype, and the first few values."""
+    flat = t.flatten()
+    return {
+        "shape": list(t.shape),
+        "dtype": str(t.dtype),
+        "first_values": flat[:num_values].float().cpu().tolist(),
+    }
+
+
+def dump_tensor_meta(obj, path):
+    """Write a JSON file describing tensor(s): shape, dtype, first values."""
+    if torch.is_tensor(obj):
+        meta = tensor_summary(obj)
+    else:
+        # dict-like (e.g. inputs): summarize each tensor entry.
+        meta = {
+            k: (tensor_summary(v) if torch.is_tensor(v) else repr(v))
+            for k, v in obj.items()
+        }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
+def get_dump_dir():
+    """Resolve the dump directory from DUMP_DIR (created on first use)."""
+    dump_dir = Path(os.environ.get("DUMP_DIR", "./dump_megatron_step37")).resolve()
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    return dump_dir
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +301,11 @@ def main(args) -> None:
         # Step3.7: keep the full Step3VLProcessor output and pre-build the
         # list[ImageForInsert] consumed by Step37Model.forward.
         s37_inputs = process_step37_inputs(processor, args.image_path, args.prompt)
+        print(f"for debug, rank {rank}, s37_inputs: {s37_inputs}", flush=True)
         input_ids_raw = s37_inputs["input_ids"]
+        print(f"for debug, rank {rank}, input_ids_raw: {input_ids_raw}", flush=True)
         step37_images = build_step37_images(s37_inputs, tokenizer)
+        print(f"for debug, rank {rank}, step37_images: {step37_images}", flush=True)
     elif args.video_path:
         input_ids_raw, pixel_values_videos, video_grid_thw = process_video_inputs(
             processor, args.video_path, args.prompt, fps=args.video_fps
@@ -296,6 +339,49 @@ def main(args) -> None:
     pixel_values_videos = to_cuda(pixel_values_videos)
     video_grid_thw = to_cuda(video_grid_thw)
     image_position_ids = to_cuda(image_position_ids)
+
+    # ------------------------------------------------------------------
+    # Dump input info (rank 0 only). (idx 0, 1)
+    # ------------------------------------------------------------------
+    dump_dir = get_dump_dir()
+    print_rank_0(f"dump_dir: {dump_dir}")
+    if rank == 0:
+        with open(dump_dir / "0_messages.json", "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "hf_model_path": args.hf_model_path,
+                    "image_path": args.image_path,
+                    "image_paths": args.image_paths,
+                    "video_path": args.video_path,
+                    "prompt": args.prompt,
+                    "model_type": model_type,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        # Collect whatever input tensors this model family produced.
+        input_dump = {"input_ids": input_ids_raw}
+        for name, val in (
+            ("pixel_values", pixel_values),
+            ("image_grid_thw", image_grid_thw),
+            ("image_sizes", image_sizes),
+            ("mm_token_type_ids", mm_token_type_ids),
+            ("image_position_ids", image_position_ids),
+            ("pixel_values_videos", pixel_values_videos),
+            ("video_grid_thw", video_grid_thw),
+        ):
+            if torch.is_tensor(val):
+                input_dump[name] = val
+        if is_step37 and step37_images is not None:
+            input_dump["num_step37_images"] = len(step37_images)
+
+        torch.save(
+            {k: (v.cpu() if torch.is_tensor(v) else v) for k, v in input_dump.items()},
+            dump_dir / "1_inputs.pt",
+        )
+        dump_tensor_meta(input_dump, dump_dir / "1_inputs_meta.json")
 
     # ------------------------------------------------------------------
     # Greedy generation loop
@@ -371,6 +457,13 @@ def main(args) -> None:
                 last_pos = real_seq_len - 1
                 next_token_ids = torch.argmax(output[:, last_pos], dim=-1, keepdim=True)
 
+                # Dump the first-step next-token logits for HF comparison. (idx 4)
+                if step == 0 and torch.distributed.get_rank() == get_last_rank():
+                    dump_dir = get_dump_dir()
+                    step0_logits = output[:, last_pos].contiguous()
+                    torch.save(step0_logits.cpu(), dump_dir / "4_step0_logits.pt")
+                    dump_tensor_meta(step0_logits, dump_dir / "4_step0_logits_meta.json")
+
                 if step < 5:
                     print_rank_last(
                         f"Step {step}: output shape={output.shape}, "
@@ -404,6 +497,15 @@ def main(args) -> None:
     print_rank_0(f"Prompt: {args.prompt}")
     print_rank_0(f"Generated: {generated_text}")
     print_rank_0("=======================================")
+
+    # ------------------------------------------------------------------
+    # Dump generated_ids and output text (rank 0 only). (idx 2, 3)
+    # ------------------------------------------------------------------
+    if rank == 0:
+        torch.save(generated_ids.cpu(), dump_dir / "2_generated_ids.pt")
+        dump_tensor_meta(generated_ids, dump_dir / "2_generated_ids_meta.json")
+        with open(dump_dir / "3_output_text.json", "w", encoding="utf-8") as f:
+            json.dump({"output_text": generated_text}, f, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":
