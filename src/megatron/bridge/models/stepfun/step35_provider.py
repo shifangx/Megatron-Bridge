@@ -156,9 +156,27 @@ class Step35DecoderLayer(TransformerLayer):
         # None) and sliding layers silently fall back to pure causal SDPA, which
         # diverges from SteptronOss on any chunk longer than the window.
         self._layer_idx = layer_idx
-        core_attn = getattr(getattr(self, "self_attention", None), "core_attention", None)
+        self_attn = getattr(self, "self_attention", None)
+        if self_attn is not None:
+            self_attn._layer_idx = layer_idx
+        core_attn = getattr(self_attn, "core_attention", None) if self_attn is not None else None
         if core_attn is not None:
             core_attn._layer_idx = layer_idx
+
+        # When ``MEGATRON_LOAD_ROPE_PATH`` is set, the unfused RoPE in
+        # ``_apply_rotary_pos_emb_bshd`` overrides its cos/sin with tensors
+        # dumped by SteptronOss's ``YARNRoPE._maybe_save_cos_sin`` (file naming:
+        # ``rope_layer{L:03d}_call{N}.pt`` where N=0 is q, N=1 is k). The dump
+        # uses a per-(layer, q/k) counter modulo 2, so the loader needs the
+        # same: a per-forward call counter on ``self_attention`` that starts
+        # at 0 before q and increments to 1 before k. The pre-hook below
+        # resets the counter on every ``self_attention.forward`` entry.
+        if os.environ.get("MEGATRON_LOAD_ROPE_PATH") and self_attn is not None:
+            def _reset_rope_call_counter(module, args, kwargs=None):
+                module._rope_call_counter = 0
+                return None
+            self_attn._rope_call_counter = 0
+            self_attn.register_forward_pre_hook(_reset_rope_call_counter, with_kwargs=True)
 
         # When ``USE_DEBUG_SUBMODULE=1`` swaps ``submodules.mlp.module`` from
         # ``MoELayer`` to ``MoELayer_debug``, TransformerLayer.__init__ skips its
