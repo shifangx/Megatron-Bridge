@@ -1007,6 +1007,9 @@ def get_batch(
             b = _partition_packed_batch_for_cp(b, cp_size)
         else:
             b = get_batch_on_this_cp_rank(b, cp_group=pg_collection.cp)
+        tokens = b.get("tokens")
+        print(f"[ALIGN] in get_batch, input tokens.shape: {tokens.shape}")
+        print(f"[ALIGN] in get_batch, input tokens: {tokens}")
         return (
             b.get("tokens"),
             b.get("labels"),
@@ -1019,6 +1022,8 @@ def get_batch(
             None,
             None,
         )
+    else:
+        print(f"[ALIGN] _align_batch_path not found: {_align_batch_path}")
     # ===== END ALIGNMENT =====
 
     # Determine pipeline stage role via process group collection
