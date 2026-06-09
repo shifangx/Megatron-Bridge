@@ -53,7 +53,10 @@ from megatron.bridge.models.stepfun.modelling_step37.transformer_config import (
     Step37TransformerConfig,
 )
 from megatron.bridge.models.stepfun.modelling_step37.vision_model import Step37VisionModel
-
+from megatron.core.utils import (
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 class Step37Model(MegatronModule):
     """Step3.7 multimodal model.
@@ -311,17 +314,22 @@ class Step37Model(MegatronModule):
         combined_embeddings = None
 
         if self.pre_process:
+            nvtx_range_push(suffix="encode_images_for_insert")
             # 1) Vision encode: list[ImageForInsert]/raw → list[ImageForInsert]/encoded
             processed_images = self._encode_images_for_insert(images)
+            nvtx_range_pop(suffix="encode_images_for_insert")
 
+            nvtx_range_push(suffix="forward_head")
             # 2) Vision-text fusion: word embedding + align_projector + scatter.
             combined_embeddings = self.forward_head(
                 input_ids=input_ids,
                 images=processed_images,
                 position_ids=position_ids,
             )
+            nvtx_range_pop(suffix="forward_head")
 
         # 3) Decoder + MTP + output_layer.
+        nvtx_range_push(suffix="language_model")
         output = self.language_model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -335,6 +343,7 @@ class Step37Model(MegatronModule):
             **(extra_block_kwargs or {}),
             **kwargs,
         )
+        nvtx_range_pop(suffix="language_model")
         return output
 
 
