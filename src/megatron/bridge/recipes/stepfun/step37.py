@@ -239,20 +239,29 @@ def step37_sft_flickr8k_smoke_config(
     *,
     sample_count: int = 8,
     max_packing_seqlen: int = 2048,
-    fixed_pack_idx: int = 0,
+    fixed_pack_idx: Optional[int] = None,
     train_iters: int = 100,
     max_lr: float = 5e-3,
     cache_dir: str = ".cache/step37_flickr8k_smoke",
 ) -> ConfigContainer:
-    """Smoke variant of :func:`step37_flickr8k_sft_config` — the same packed
-    sample on every DP rank, every step. Deterministic and tiny: it repeats
-    pack[``fixed_pack_idx``] indefinitely so the loss curve visibly drops as
-    the model overfits a single batch.
+    """Smoke variant of :func:`step37_flickr8k_sft_config` — a deterministic,
+    tiny config for quickly exercising the training loop. By default packs are
+    drawn sequentially from a small slice. Optionally set ``fixed_pack_idx`` to
+    pin every DP rank and every step to a single pack, which makes the loss
+    curve visibly drop as the model overfits one batch.
+
+    .. note::
+        ``fixed_pack_idx`` is a benchmarking aid only — feeding the exact same
+        pack every step removes data-loading and shape variability so step
+        time / throughput numbers are comparable run to run. It is NOT meant
+        for real training; leave it as ``None`` for any run whose learned
+        weights you care about.
 
     Differences vs. the regular SFT config:
 
-    - ``dataset.fixed_pack_idx`` pins ``__getitem__`` → identical input
-      across every DP rank and every iteration.
+    - ``dataset.fixed_pack_idx`` (when set to an int) pins ``__getitem__`` →
+      identical input across every DP rank and every iteration. ``None``
+      (default) leaves normal pack sampling in place.
     - ``dataset.dataset_sampling = "sequential"`` for reproducibility.
     - ``max_lr`` bumped 5e-6 → 5e-3 so the overfit happens within
       ``train_iters`` steps.
@@ -267,7 +276,10 @@ def step37_sft_flickr8k_smoke_config(
         sample_count: tiny train slice (default ``8``); raise only if pack 0
             is unrepresentative.
         max_packing_seqlen: max NTP-length tokens per pack.
-        fixed_pack_idx: which pack to repeat (default ``0``).
+        fixed_pack_idx: which pack to repeat. ``None`` (default) disables
+            the fixed-pack behavior so packs are drawn normally; set an int
+            to pin ``__getitem__`` to that single pack. Benchmark only — do
+            not set for real training (see note above).
         train_iters: number of smoke iterations (default ``100``).
         max_lr: peak LR for the cosine schedule (default ``5e-3``).
         cache_dir: separate cache so the smoke download doesn't shadow
