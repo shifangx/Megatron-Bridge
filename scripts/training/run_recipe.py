@@ -115,6 +115,7 @@ from megatron.bridge.diffusion.models.wan.wan_step import WanForwardStep
 from megatron.bridge.models.qwen_omni.qwen3_omni_step import forward_step as qwen3_omni_forward_step
 from megatron.bridge.models.qwen_vl.qwen3_vl_step import forward_step as qwen3_vl_forward_step
 from megatron.bridge.models.stepfun.step37_flickr8k_step import forward_step as step37_flickr8k_forward_step
+from megatron.bridge.models.stepfun.step37_mock_step import forward_step as step37_mock_forward_step
 from megatron.bridge.recipes.utils.dataset_utils import (
     DATASET_TYPES,
     apply_dataset_override,
@@ -138,6 +139,7 @@ STEP_FUNCTIONS: dict[str, Callable] = {
     "qwen3_omni_step": qwen3_omni_forward_step,
     "qwen3_vl_step": qwen3_vl_forward_step,
     "step37_flickr8k_step": step37_flickr8k_forward_step,
+    "step37_mock_step": step37_mock_forward_step,
     "llava_step": llava_forward_step,
     "nemotron_omni_step": nemotron_omni_forward_step,
     "flux_step": FluxForwardStep,

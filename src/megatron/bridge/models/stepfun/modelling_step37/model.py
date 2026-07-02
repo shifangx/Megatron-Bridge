@@ -43,6 +43,10 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.utils import (
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 from megatron.bridge.models.stepfun.modelling_step37.image_insert_embedding import (
     ImageForInsert,
@@ -51,12 +55,11 @@ from megatron.bridge.models.stepfun.modelling_step37.image_insert_embedding impo
 from megatron.bridge.models.stepfun.modelling_step37.text_model import Step37GPTModel
 from megatron.bridge.models.stepfun.modelling_step37.transformer_config import (
     Step37TransformerConfig,
+    build_step37_vision_transformer_config,
 )
 from megatron.bridge.models.stepfun.modelling_step37.vision_model import Step37VisionModel
-from megatron.core.utils import (
-    nvtx_range_pop,
-    nvtx_range_push,
-)
+from megatron.bridge.models.stepfun.modelling_step37.vision_model_mcore import Step37VisionModelMcore
+
 
 class Step37Model(MegatronModule):
     """Step3.7 multimodal model.
@@ -121,7 +124,23 @@ class Step37Model(MegatronModule):
         self.embd_group = getattr(pg_collection, "embd", None)
 
         if self.pre_process and self.add_encoder:
-            self.vision_model = Step37VisionModel(vision_transformer_config)
+            # Select the vision-tower implementation. "native" is the
+            # HF-aligned pure-PyTorch PE-G/14; "mcore" assembles the transformer
+            # stack from Megatron-Core / TransformerEngine layers (see
+            # ``vision_model_mcore.py``). Both expose the same
+            # ``forward(pixels) -> [N, 169, width*4]`` contract.
+            vision_model_impl = getattr(language_transformer_config, "vision_model_impl", "native")
+            if vision_model_impl == "mcore":
+                mcore_vision_config = build_step37_vision_transformer_config(
+                    vision_transformer_config, language_transformer_config
+                )
+                self.vision_model = Step37VisionModelMcore(mcore_vision_config, vision_transformer_config)
+            elif vision_model_impl == "native":
+                self.vision_model = Step37VisionModel(vision_transformer_config)
+            else:
+                raise ValueError(
+                    f"Unknown vision_model_impl={vision_model_impl!r}; expected 'native' or 'mcore'."
+                )
 
         if self.add_decoder:
             self.language_model = Step37GPTModel(

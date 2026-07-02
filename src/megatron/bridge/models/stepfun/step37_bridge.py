@@ -34,9 +34,11 @@ The bridge:
 from __future__ import annotations
 
 import logging
-from typing import List
+import os
+from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.nn as nn
 from transformers import AutoConfig
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
@@ -44,8 +46,13 @@ from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     GatedMLPMapping,
+    MegatronParamMapping,
     QKVGMapping,
     ReplicatedMapping,
+    merge_qkv_biases,
+    merge_qkv_weights,
+    split_qkv_biases,
+    split_qkv_weights,
 )
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.stepfun.configuration_step37 import Step37Config
@@ -88,6 +95,116 @@ _LM_PREFIX = "language_model."
 def _lm(megatron_param: str) -> str:
     """Prefix a Step-3.5 megatron_param with the ``language_model.`` namespace."""
     return f"{_LM_PREFIX}{megatron_param}"
+
+
+def _vision_model_impl() -> str:
+    """Which vision tower the conversion targets ("native" | "mcore").
+
+    Read from ``STEP37_VISION_MODEL_IMPL`` (default "native") — the same knob
+    :class:`Step37ModelProvider.vision_model_impl` defaults from, so the tower
+    that gets built and the weights that get mapped stay in lock-step during an
+    offline convert.
+    """
+    return os.environ.get("STEP37_VISION_MODEL_IMPL", "native")
+
+
+class Step37VisionFusedQKVMapping(MegatronParamMapping[Dict[str, torch.Tensor]]):
+    """HF fused ``attn.in_proj_{weight,bias}`` ↔ MCore ``linear_qkv.{weight,bias}``.
+
+    The PE-G/14 attention stores a single fused ``in_proj`` of shape ``[3H, H]``
+    (rows ``[q(H); k(H); v(H)]``). MCore's ``linear_qkv`` uses the per-head
+    interleaved GQA layout, so we split the fused tensor into q/k/v and reuse the
+    framework's ``merge_qkv_*`` helpers (and the inverse on export). TP/PP
+    distribution is delegated to :class:`AutoMapping` (identity at vision TP=1).
+    """
+
+    def __init__(self, megatron_param: str, in_proj: str):
+        super().__init__(megatron_param, {"in_proj": in_proj})
+        self._tp_mapping = AutoMapping(megatron_param, megatron_param)
+
+    def hf_to_megatron(self, hf_weights: Dict[str, torch.Tensor], megatron_module: nn.Module) -> torch.Tensor:
+        if self.tp_rank == 0:
+            in_proj = hf_weights["in_proj"]
+            h = in_proj.shape[0] // 3
+            q, k, v = in_proj[:h], in_proj[h : 2 * h], in_proj[2 * h :]
+            config = self._get_config(megatron_module)
+            if in_proj.ndim == 1:
+                merged = merge_qkv_biases(config, q, k, v)
+            else:
+                merged = merge_qkv_weights(config, q, k, v)
+        else:
+            merged = None
+        return self._tp_mapping.hf_to_megatron(merged, megatron_module)
+
+    def megatron_to_hf(
+        self, megatron_weights: Optional[torch.Tensor], megatron_module: Optional[nn.Module]
+    ) -> Dict[str, torch.Tensor]:
+        if megatron_weights is not None:
+            megatron_weights = self.maybe_dequantize(megatron_weights)
+        packed = self._tp_mapping.megatron_to_hf(megatron_weights, megatron_module)
+        if not packed:
+            return {}
+        qkv = next(iter(packed.values()))
+        if megatron_module is not None:
+            config = self._get_config(megatron_module)
+        else:
+            config = None
+        if qkv.ndim == 1:
+            q, k, v = split_qkv_biases(config, qkv)
+        else:
+            q, k, v = split_qkv_weights(config, qkv)
+        return {self.hf_param["in_proj"]: torch.cat([q, k, v], dim=0)}
+
+    def resolve(self, captures: Tuple[str, ...]) -> "Step37VisionFusedQKVMapping":
+        resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
+        return type(self)(resolved_megatron_param, resolved_hf_param["in_proj"])
+
+
+class Step37VisionLayerScaleMapping(MegatronParamMapping[Dict[str, torch.Tensor]]):
+    """Fold PE-G/14 LayerScale γ into a following linear's output rows.
+
+    The native tower applies ``residual + γ ⊙ sublayer(x)``; MCore's standard TE
+    layer has no LayerScale, so on import we fold γ into the rows of the
+    projection weight/bias (``linear_proj`` for ``ls_1``, ``linear_fc2`` for
+    ``ls_2``) — equivalent because γ scales the sublayer output channel-wise and
+    that output is exactly the projection's output dim.
+
+    Export note: the (γ, weight) split is not unique, so ``megatron_to_hf``
+    writes the folded weight back to the linear and emits ``γ = 1`` — a
+    numerically equivalent HF checkpoint, not a byte-identical round-trip.
+    """
+
+    def __init__(self, megatron_param: str, linear: str, gamma: str):
+        super().__init__(megatron_param, {"linear": linear, "gamma": gamma})
+        self._tp_mapping = AutoMapping(megatron_param, megatron_param)
+
+    @staticmethod
+    def _row_scale(weight: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
+        # weight: [out, ...] or [out]; gamma: [out]. Scale along dim 0.
+        return weight * gamma.reshape([-1] + [1] * (weight.dim() - 1)).to(weight.dtype)
+
+    def hf_to_megatron(self, hf_weights: Dict[str, torch.Tensor], megatron_module: nn.Module) -> torch.Tensor:
+        if self.tp_rank == 0:
+            folded = self._row_scale(hf_weights["linear"], hf_weights["gamma"])
+        else:
+            folded = None
+        return self._tp_mapping.hf_to_megatron(folded, megatron_module)
+
+    def megatron_to_hf(
+        self, megatron_weights: Optional[torch.Tensor], megatron_module: Optional[nn.Module]
+    ) -> Dict[str, torch.Tensor]:
+        if megatron_weights is not None:
+            megatron_weights = self.maybe_dequantize(megatron_weights)
+        packed = self._tp_mapping.megatron_to_hf(megatron_weights, megatron_module)
+        if not packed:
+            return {}
+        weight = next(iter(packed.values()))
+        gamma = torch.ones(weight.shape[0], dtype=weight.dtype, device=weight.device)
+        return {self.hf_param["linear"]: weight, self.hf_param["gamma"]: gamma}
+
+    def resolve(self, captures: Tuple[str, ...]) -> "Step37VisionLayerScaleMapping":
+        resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
+        return type(self)(resolved_megatron_param, resolved_hf_param["linear"], resolved_hf_param["gamma"])
 
 
 @MegatronModelBridge.register_bridge(
@@ -483,52 +600,106 @@ class Step37Bridge(MegatronModelBridge):
         #   ``ConcatenatedQKVMapping`` to fold HF's fused QKV into MCore's
         #   ``[3*H, H]`` ``linear_qkv``.
 
-        # Norms — AutoMapping handles these via the "Norm/Normalization"
-        # substring fallback.
-        vision_norm_param_mappings = {
-            "vision_model.ln_pre.weight": "vision_model.ln_pre.weight",
-            "vision_model.ln_pre.bias": "vision_model.ln_pre.bias",
-            "vision_model.transformer.resblocks.*.ln_1.weight": "vision_model.transformer.resblocks.*.ln_1.weight",
-            "vision_model.transformer.resblocks.*.ln_1.bias": "vision_model.transformer.resblocks.*.ln_1.bias",
-            "vision_model.transformer.resblocks.*.ln_2.weight": "vision_model.transformer.resblocks.*.ln_2.weight",
-            "vision_model.transformer.resblocks.*.ln_2.bias": "vision_model.transformer.resblocks.*.ln_2.bias",
-        }
-        for megatron_param, hf_param in vision_norm_param_mappings.items():
-            mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
+        # Shared (both towers) — ``ln_pre`` norm handled by AutoMapping's
+        # "Norm/Normalization" substring fallback.
+        mapping_list.append(AutoMapping(megatron_param="vision_model.ln_pre.weight", hf_param="vision_model.ln_pre.weight"))
+        mapping_list.append(AutoMapping(megatron_param="vision_model.ln_pre.bias", hf_param="vision_model.ln_pre.bias"))
 
-        # Everything else in the vision tower → ReplicatedMapping. Grouped
-        # by physical category for readability; one big loop at the end.
-        vision_replicated_param_mappings = {
-            # Patch embedding + downsampler convs (Conv2d, not in registry).
+        # Shared replicated params — patch-embed / downsampler convs, the
+        # top-level positional embedding, and the vision→LM projector. These
+        # modules are byte-identical in both towers, so the mapping is unchanged.
+        vision_shared_replicated = {
             "vision_model.conv1.weight": "vision_model.conv1.weight",
             "vision_model.vit_downsampler1.weight": "vision_model.vit_downsampler1.weight",
             "vision_model.vit_downsampler1.bias": "vision_model.vit_downsampler1.bias",
             "vision_model.vit_downsampler2.weight": "vision_model.vit_downsampler2.weight",
             "vision_model.vit_downsampler2.bias": "vision_model.vit_downsampler2.bias",
-            # Top-level nn.Parameter on Step37VisionModel — AutoMapping
-            # would see the top-level vision class as the owning module.
             "vision_model.positional_embedding": "vision_model.positional_embedding",
-            # Attention — in_proj_* are bare nn.Parameter on
-            # EncoderVisionAttention; out_proj.* are plain nn.Linear.
-            "vision_model.transformer.resblocks.*.attn.in_proj_weight": "vision_model.transformer.resblocks.*.attn.in_proj_weight",
-            "vision_model.transformer.resblocks.*.attn.in_proj_bias": "vision_model.transformer.resblocks.*.attn.in_proj_bias",
-            "vision_model.transformer.resblocks.*.attn.out_proj.weight": "vision_model.transformer.resblocks.*.attn.out_proj.weight",
-            "vision_model.transformer.resblocks.*.attn.out_proj.bias": "vision_model.transformer.resblocks.*.attn.out_proj.bias",
-            # LayerScale gates — gamma is an nn.Parameter on EncoderLayerScale.
-            "vision_model.transformer.resblocks.*.ls_1.gamma": "vision_model.transformer.resblocks.*.ls_1.gamma",
-            "vision_model.transformer.resblocks.*.ls_2.gamma": "vision_model.transformer.resblocks.*.ls_2.gamma",
-            # MLP — plain nn.Linear (c_fc, c_proj) inside EncoderMLP.
-            "vision_model.transformer.resblocks.*.mlp.c_fc.weight": "vision_model.transformer.resblocks.*.mlp.c_fc.weight",
-            "vision_model.transformer.resblocks.*.mlp.c_fc.bias": "vision_model.transformer.resblocks.*.mlp.c_fc.bias",
-            "vision_model.transformer.resblocks.*.mlp.c_proj.weight": "vision_model.transformer.resblocks.*.mlp.c_proj.weight",
-            "vision_model.transformer.resblocks.*.mlp.c_proj.bias": "vision_model.transformer.resblocks.*.mlp.c_proj.bias",
-            # Vision → LM projector. On the Megatron side the projector lives
-            # inside ``image_insert_embedding.align_projector``; on the HF side
-            # it is the top-level ``vit_large_projector`` linear.
             "image_insert_embedding.align_projector.weight": "vit_large_projector.weight",
         }
-        for megatron_param, hf_param in vision_replicated_param_mappings.items():
+        for megatron_param, hf_param in vision_shared_replicated.items():
             mapping_list.append(ReplicatedMapping(megatron_param=megatron_param, hf_param=hf_param))
+
+        # Transformer stack — differs by tower. HF names are always
+        # ``vision_model.transformer.resblocks.*`` (the released safetensors
+        # layout); only the Megatron-side names + fusions change.
+        hf_res = "vision_model.transformer.resblocks.*"
+        if _vision_model_impl() == "mcore":
+            # MCore ``TransformerBlock`` (see ``vision_model_mcore.py``).
+            mcore = "vision_model.decoder.layers.*"
+            # Fused input / pre-mlp layernorms live on the TE linear modules.
+            for mp, hp in {
+                f"{mcore}.self_attention.linear_qkv.layer_norm_weight": f"{hf_res}.ln_1.weight",
+                f"{mcore}.self_attention.linear_qkv.layer_norm_bias": f"{hf_res}.ln_1.bias",
+                f"{mcore}.mlp.linear_fc1.layer_norm_weight": f"{hf_res}.ln_2.weight",
+                f"{mcore}.mlp.linear_fc1.layer_norm_bias": f"{hf_res}.ln_2.bias",
+                # MLP c_fc → linear_fc1; c_proj handled by the γ-fold below.
+                f"{mcore}.mlp.linear_fc1.weight": f"{hf_res}.mlp.c_fc.weight",
+                f"{mcore}.mlp.linear_fc1.bias": f"{hf_res}.mlp.c_fc.bias",
+            }.items():
+                mapping_list.append(AutoMapping(megatron_param=mp, hf_param=hp))
+
+            # Fused in_proj → interleaved linear_qkv.
+            mapping_list.append(
+                Step37VisionFusedQKVMapping(
+                    megatron_param=f"{mcore}.self_attention.linear_qkv.weight",
+                    in_proj=f"{hf_res}.attn.in_proj_weight",
+                )
+            )
+            mapping_list.append(
+                Step37VisionFusedQKVMapping(
+                    megatron_param=f"{mcore}.self_attention.linear_qkv.bias",
+                    in_proj=f"{hf_res}.attn.in_proj_bias",
+                )
+            )
+            # out_proj (× ls_1) → linear_proj ; c_proj (× ls_2) → linear_fc2.
+            mapping_list.extend(
+                [
+                    Step37VisionLayerScaleMapping(
+                        megatron_param=f"{mcore}.self_attention.linear_proj.weight",
+                        linear=f"{hf_res}.attn.out_proj.weight",
+                        gamma=f"{hf_res}.ls_1.gamma",
+                    ),
+                    Step37VisionLayerScaleMapping(
+                        megatron_param=f"{mcore}.self_attention.linear_proj.bias",
+                        linear=f"{hf_res}.attn.out_proj.bias",
+                        gamma=f"{hf_res}.ls_1.gamma",
+                    ),
+                    Step37VisionLayerScaleMapping(
+                        megatron_param=f"{mcore}.mlp.linear_fc2.weight",
+                        linear=f"{hf_res}.mlp.c_proj.weight",
+                        gamma=f"{hf_res}.ls_2.gamma",
+                    ),
+                    Step37VisionLayerScaleMapping(
+                        megatron_param=f"{mcore}.mlp.linear_fc2.bias",
+                        linear=f"{hf_res}.mlp.c_proj.bias",
+                        gamma=f"{hf_res}.ls_2.gamma",
+                    ),
+                ]
+            )
+        else:
+            # Native HF-aligned tower (:class:`Step37VisionModel`): 1:1 names.
+            for mp, hp in {
+                f"{hf_res}.ln_1.weight": f"{hf_res}.ln_1.weight",
+                f"{hf_res}.ln_1.bias": f"{hf_res}.ln_1.bias",
+                f"{hf_res}.ln_2.weight": f"{hf_res}.ln_2.weight",
+                f"{hf_res}.ln_2.bias": f"{hf_res}.ln_2.bias",
+            }.items():
+                mapping_list.append(AutoMapping(megatron_param=mp, hf_param=hp))
+            vision_native_replicated = {
+                f"{hf_res}.attn.in_proj_weight": f"{hf_res}.attn.in_proj_weight",
+                f"{hf_res}.attn.in_proj_bias": f"{hf_res}.attn.in_proj_bias",
+                f"{hf_res}.attn.out_proj.weight": f"{hf_res}.attn.out_proj.weight",
+                f"{hf_res}.attn.out_proj.bias": f"{hf_res}.attn.out_proj.bias",
+                f"{hf_res}.ls_1.gamma": f"{hf_res}.ls_1.gamma",
+                f"{hf_res}.ls_2.gamma": f"{hf_res}.ls_2.gamma",
+                f"{hf_res}.mlp.c_fc.weight": f"{hf_res}.mlp.c_fc.weight",
+                f"{hf_res}.mlp.c_fc.bias": f"{hf_res}.mlp.c_fc.bias",
+                f"{hf_res}.mlp.c_proj.weight": f"{hf_res}.mlp.c_proj.weight",
+                f"{hf_res}.mlp.c_proj.bias": f"{hf_res}.mlp.c_proj.bias",
+            }
+            for megatron_param, hf_param in vision_native_replicated.items():
+                mapping_list.append(ReplicatedMapping(megatron_param=megatron_param, hf_param=hf_param))
 
         return MegatronMappingRegistry(*mapping_list)
 

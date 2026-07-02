@@ -21,7 +21,8 @@ returns a :class:`Step37Model` instance instead of a bare ``GPTModel``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -58,6 +59,12 @@ class Step37ModelProvider(Step35ModelProvider):
     understand_projector_stride: int = 2
     projector_bias: bool = False
     language_max_sequence_length: int = 262144
+
+    # Which vision-tower implementation to build ("native" | "mcore"). Defaults
+    # from ``STEP37_VISION_MODEL_IMPL`` so the offline convert flow (which builds
+    # the provider without a recipe/CLI) picks the same tower the bridge maps
+    # weights for; training recipes can override via ``model.vision_model_impl``.
+    vision_model_impl: str = field(default_factory=lambda: os.environ.get("STEP37_VISION_MODEL_IMPL", "native"))
 
     # Freeze knobs (mirroring Qwen3VLModelProvider).
     freeze_language_model: bool = False

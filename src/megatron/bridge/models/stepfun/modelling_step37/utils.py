@@ -120,21 +120,29 @@ class EncoderRope2D(nn.Module):
         freqs = freqs[None, None, ...]
         return freqs
 
+    def get_freqs(self, grid_hw: Tuple[int, int], device: torch.device) -> torch.Tensor:
+        """Return the cached (or gathered) 2D rope freqs for ``grid_hw``.
+
+        Shape ``[1, 1, grid_h*grid_w(+cls), dim]``. Split out of :meth:`forward`
+        so callers that apply the rotation themselves (e.g. the MCore vision
+        attention) can reuse the exact same frequency table.
+        """
+        if grid_hw[0] != self.max_grid_height or grid_hw[1] != self.max_grid_width:
+            rows = torch.arange(grid_hw[0], device=device).view(-1, 1)
+            cols = torch.arange(grid_hw[1], device=device).view(1, -1)
+            positions = (rows * self.max_grid_width + cols).reshape(-1).to(torch.long)
+            if self.use_cls_token:
+                positions = torch.cat([torch.zeros(1, device=device), positions + 1], dim=0)
+            return self.freqs_cache.index_select(2, positions)
+        return self.freqs_cache
+
     def forward(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         grid_hw: Tuple[int, int],
     ):
-        if grid_hw[0] != self.max_grid_height or grid_hw[1] != self.max_grid_width:
-            rows = torch.arange(grid_hw[0], device=q.device).view(-1, 1)
-            cols = torch.arange(grid_hw[1], device=q.device).view(1, -1)
-            positions = (rows * self.max_grid_width + cols).reshape(-1).to(torch.long)
-            if self.use_cls_token:
-                positions = torch.cat([torch.zeros(1, device=q.device), positions + 1], dim=0)
-            freqs = self.freqs_cache.index_select(2, positions)
-        else:
-            freqs = self.freqs_cache
+        freqs = self.get_freqs(grid_hw, q.device)
         q = apply_rotary_emb(freqs, q)
         k = apply_rotary_emb(freqs, k)
         return q, k

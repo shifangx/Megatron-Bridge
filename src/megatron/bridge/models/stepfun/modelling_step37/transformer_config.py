@@ -27,6 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import torch.nn.functional as F
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -48,6 +49,11 @@ class Step37TransformerConfig(TransformerConfig):
     understand_projector_stride: int = 2
     projector_bias: bool = False
     language_max_sequence_length: int = 262144
+    # Which vision-tower implementation to build:
+    #   "native" — the HF-aligned pure-PyTorch PE-G/14 (:class:`Step37VisionModel`)
+    #   "mcore"  — the Megatron-Core / TransformerEngine assembled tower
+    #              (:class:`Step37VisionModelMcore`)
+    vision_model_impl: str = "native"
 
 
 def get_vision_model_config(vision_cfg: Any) -> Any:
@@ -60,3 +66,68 @@ def get_vision_model_config(vision_cfg: Any) -> Any:
     for parity with the Qwen3-VL package shape. It is intentionally a no-op.
     """
     return vision_cfg
+
+
+_HIDDEN_ACT_TO_FN = {
+    "gelu": F.gelu,
+    "gelu_new": lambda x: F.gelu(x, approximate="tanh"),
+    "gelu_pytorch_tanh": lambda x: F.gelu(x, approximate="tanh"),
+    "quick_gelu": lambda x: x * F.sigmoid(1.702 * x),
+    "relu": F.relu,
+    "silu": F.silu,
+}
+
+
+def build_step37_vision_transformer_config(vision_cfg: Any, base_config: TransformerConfig) -> TransformerConfig:
+    """Build a Megatron ``TransformerConfig`` for the MCore Step3.7 vision tower.
+
+    Maps the HF ``StepRoboticsVisionEncoderConfig`` (PE-G/14) fields onto a
+    dense, TP=1 ``TransformerConfig`` suitable for
+    :class:`Step37VisionModelMcore`. Compute/dtype fields are copied from
+    ``base_config`` (the text-side Step3.7 config) so the vision tower runs in
+    the same precision as the decoder.
+
+    Notes:
+        * ``position_embedding_type="none"`` — the 2D rope is applied manually
+          inside :class:`Step37VisionSelfAttention`, not by MCore.
+        * ``gated_linear_unit=False`` and biases enabled to match the PE MLP
+          (``c_fc``/``c_proj``) and fused ``in_proj``/``out_proj`` layout.
+    """
+    width = int(vision_cfg.width)
+    heads = int(vision_cfg.heads)
+    mlp_ratio = float(getattr(vision_cfg, "mlp_ratio", 8960 / 1536))
+    hidden_act = getattr(vision_cfg, "hidden_act", "gelu")
+    activation_func = _HIDDEN_ACT_TO_FN.get(hidden_act, F.gelu)
+
+    return TransformerConfig(
+        num_layers=int(vision_cfg.layers),
+        hidden_size=width,
+        num_attention_heads=heads,
+        num_query_groups=heads,
+        kv_channels=width // heads,
+        ffn_hidden_size=int(width * mlp_ratio),
+        normalization="LayerNorm",
+        layernorm_epsilon=float(vision_cfg.layer_norm_eps),
+        gated_linear_unit=False,
+        activation_func=activation_func,
+        add_bias_linear=True,
+        add_qkv_bias=True,
+        position_embedding_type="none",
+        apply_rope_fusion=False,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        attention_softmax_in_fp32=True,
+        bias_activation_fusion=False,
+        # Vision tower runs on a replicated (TP=1) mesh.
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        sequence_parallel=False,
+        # Inherit precision from the text-side config.
+        params_dtype=base_config.params_dtype,
+        bf16=base_config.bf16,
+        fp16=base_config.fp16,
+        autocast_dtype=getattr(base_config, "autocast_dtype", None),
+        pipeline_dtype=getattr(base_config, "pipeline_dtype", None),
+    )
