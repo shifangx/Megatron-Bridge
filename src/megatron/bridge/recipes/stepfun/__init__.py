@@ -17,10 +17,11 @@ from .step35 import (
     step35_196b_a11b_pretrain_config,
 )
 
-# Step3.7 multimodal models — only the Flickr8k SFT path is supported.
+# Step3.7 multimodal models — Flickr8k packed SFT and the synthetic BSHD mock.
 from .step37 import (
     step37_sft_flickr8k_config,
     step37_sft_flickr8k_smoke_config,
+    step37_sft_mock_config,
 )
 
 
@@ -30,4 +31,5 @@ __all__ = [
     # Step3.7 multimodal models
     "step37_sft_flickr8k_config",
     "step37_sft_flickr8k_smoke_config",
+    "step37_sft_mock_config",
 ]

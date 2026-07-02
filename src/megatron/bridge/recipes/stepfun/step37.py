@@ -33,6 +33,7 @@ import torch
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.data.vlm_datasets.step37_flickr8k import Step37Flickr8kSFTDataProvider
+from megatron.bridge.data.vlm_datasets.step37_mock import Step37MockSFTDataProvider
 from megatron.bridge.recipes.common import _sft_common
 from megatron.bridge.recipes.utils.optimizer_utils import distributed_fused_adam_with_cosine_annealing
 from megatron.bridge.recipes.utils.tokenizer_utils import DEFAULT_NULL_TOKENIZER_VOCAB_SIZE
@@ -482,7 +483,190 @@ def step37_sft_flickr8k_smoke_config(
     return cfg
 
 
+# =============================================================================
+# Step3.7 SFT — mock config (synthetic data, BSHD / unpacked layout)
+# =============================================================================
+
+
+def step37_sft_mock_config(
+    hf_path: str = "stepfun-ai/Step-3.7-Flash",
+    *,
+    seq_length: int = 2048,
+    num_images: int = 1,
+    image_size: int = 728,
+    prompt_length: int = 32,
+    response_length: int = 64,
+    num_samples: int = 1000,
+    train_iters: int = 50,
+    global_batch_size: int = 8,
+    micro_batch_size: int = 1,
+    tensor_model_parallel_size: int = 1,
+    expert_model_parallel_size: int = 8,
+    random_seed: int = 1234,
+) -> ConfigContainer:
+    """Step3.7 SFT recipe on **mock** data in the **BSHD** (unpacked) layout.
+
+    This is the Step3.7 analogue of the Qwen3-VL ``*_pretrain_mock_config``
+    recipes: it swaps the Flickr8k packed *THD* pipeline for the self-contained
+    :class:`Step37MockSFTDataProvider`, which synthesizes ``[B, S]`` batches
+    with ``list[ImageForInsert]`` and needs no dataset download. Run it with
+    the BSHD forward step::
+
+        uv run torchrun --nproc_per_node=8 run_recipe.py \\
+            --recipe step37_sft_mock_config \\
+            --step_func step37_mock_step
+
+    Unlike the Flickr8k path, ``micro_batch_size`` is not pinned to ``1`` —
+    each row is an independent unpacked sequence, so ordinary batching applies.
+    Pipeline parallelism defaults to ``1`` (single stage) so the BSHD step
+    needs no cross-stage ``cu_seqlens`` plumbing; shard the MoE model with
+    tensor / expert parallelism (or reduce ``model.num_layers`` via CLI) to fit
+    your GPU budget.
+
+    Kwargs:
+        hf_path: HF model id or local path to the Step3.7 checkpoint. Also used
+            to resolve the tokenizer vocab size + image special-token ids.
+        seq_length: fixed per-sample sequence length.
+        num_images: image spans synthesized per sample.
+        image_size: square image edge (``728`` → 169 features per image).
+        prompt_length / response_length: random text token counts (only the
+            response span is supervised).
+        num_samples: size of the synthetic train split.
+        train_iters / global_batch_size / micro_batch_size: training loop knobs.
+        tensor_model_parallel_size / expert_model_parallel_size: parallelism.
+        random_seed: seed for both the synthetic data and the RNG config.
+    """
+    cfg = _sft_common()
+
+    # ── Model: AutoBridge load from HF id or local snapshot ──────────────
+    cfg.model = AutoBridge.from_hf_pretrained(hf_path).to_megatron_provider(load_weights=False)
+    cfg.model.seq_length = seq_length
+    cfg.model.tensor_model_parallel_size = tensor_model_parallel_size
+    cfg.model.pipeline_model_parallel_size = 1
+    cfg.model.pipeline_dtype = None
+    cfg.model.virtual_pipeline_model_parallel_size = None
+    cfg.model.expert_model_parallel_size = expert_model_parallel_size
+    cfg.model.context_parallel_size = 1
+    cfg.model.sequence_parallel = False
+
+    cfg.model.freeze_language_model = False
+    cfg.model.freeze_vision_model = False
+    cfg.model.freeze_vision_projection = False
+
+    cfg.model.moe_token_dispatcher_type = "alltoall"
+    cfg.model.moe_flex_dispatcher_backend = None
+    cfg.model.moe_hybridep_num_sms = 16
+    apply_flex_dispatcher_backend(cfg.model, moe_flex_dispatcher_backend=None)
+
+    cfg.model.transformer_impl = "transformer_engine"
+    cfg.model.cuda_graph_impl = "none"
+    cfg.model.cuda_graph_scope = "full"
+    cfg.model.cuda_graph_warmup_steps = 3
+
+    cfg.model.attention_backend = "auto"
+    cfg.model.cross_entropy_loss_fusion = True
+    cfg.model.cross_entropy_fusion_impl = "native"
+
+    cfg.model.moe_router_fusion = False
+    cfg.model.moe_permute_fusion = True
+    cfg.model.moe_grouped_gemm = True
+
+    cfg.model.recompute_granularity = None
+    cfg.model.recompute_modules = None
+    cfg.model.fine_grained_activation_offloading = False
+    cfg.model.offload_modules = None
+
+    cfg.model.moe_shared_expert_overlap = False
+    cfg.model.moe_router_force_load_balancing = False
+    cfg.model.moe_router_padding_for_fp8 = False
+
+    # ── Training (smoke defaults) ─────────────────────────────────────────
+    cfg.train.train_iters = train_iters
+    cfg.train.global_batch_size = global_batch_size
+    cfg.train.micro_batch_size = micro_batch_size
+    cfg.train.manual_gc = True
+    cfg.train.manual_gc_interval = 100
+    cfg.train.manual_gc_eval = 100
+
+    cfg.validation.eval_interval = 500
+    cfg.validation.eval_iters = 10
+
+    # ── Optimizer (full SFT — low LR) ─────────────────────────────────────
+    opt_cfg, scheduler_cfg = distributed_fused_adam_with_cosine_annealing(
+        lr_warmup_iters=10,
+        lr_decay_iters=train_iters,
+        max_lr=5e-6,
+        min_lr=5e-7,
+    )
+    cfg.optimizer = opt_cfg
+    cfg.scheduler = scheduler_cfg
+    cfg.optimizer.use_precision_aware_optimizer = False
+    cfg.optimizer.main_grads_dtype = torch.float32
+    cfg.optimizer.main_params_dtype = torch.float32
+    cfg.optimizer.exp_avg_dtype = torch.float32
+    cfg.optimizer.exp_avg_sq_dtype = torch.float32
+
+    # ── DDP (no overlap for VLMs) ─────────────────────────────────────────
+    cfg.ddp = DistributedDataParallelConfig(
+        check_for_nan_in_grad=True,
+        grad_reduce_in_fp32=True,
+        overlap_grad_reduce=False,
+        overlap_param_gather=False,
+        average_in_collective=True,
+        data_parallel_sharding_strategy="optim_grads_params",
+        use_distributed_optimizer=True,
+    )
+
+    cfg.comm_overlap = None
+    cfg.mixed_precision = "bf16_mixed"
+
+    # ── Tokenizer (NullTokenizer placeholder; CLI must set padded_vocab_size) ─
+    cfg.tokenizer = TokenizerConfig(
+        tokenizer_type="NullTokenizer",
+        vocab_size=DEFAULT_NULL_TOKENIZER_VOCAB_SIZE,
+    )
+
+    # ── Logger ────────────────────────────────────────────────────────────
+    base_output_dir = os.path.join(os.getcwd(), "nemo_experiments")
+    run_output_dir = os.path.join(base_output_dir, "default")
+    tensorboard_dir = os.path.join(run_output_dir, "tb_logs")
+    checkpoint_dir = os.path.join(run_output_dir, "checkpoints")
+    cfg.logger = LoggerConfig(
+        log_interval=10,
+        tensorboard_dir=tensorboard_dir,
+        log_timers_to_tensorboard=True,
+    )
+
+    # ── Checkpoint ────────────────────────────────────────────────────────
+    cfg.checkpoint.save_interval = 500
+    cfg.checkpoint.save = checkpoint_dir
+    cfg.checkpoint.load = checkpoint_dir
+    cfg.checkpoint.ckpt_format = "torch_dist"
+    cfg.checkpoint.fully_parallel_save = True
+
+    cfg.rng = RNGConfig(seed=random_seed)
+
+    # ── Dataset: synthetic BSHD provider ──────────────────────────────────
+    cfg.dataset = Step37MockSFTDataProvider(
+        tokenizer_path=hf_path,
+        seq_length=seq_length,
+        num_samples=num_samples,
+        num_images=num_images,
+        image_size=image_size,
+        prompt_length=prompt_length,
+        response_length=response_length,
+        random_seed=random_seed,
+        num_workers=0,
+        persistent_workers=False,
+        pin_memory=True,
+        data_sharding=False,
+    )
+
+    return cfg
+
+
 __all__ = [
     "step37_sft_flickr8k_config",
     "step37_sft_flickr8k_smoke_config",
+    "step37_sft_mock_config",
 ]
