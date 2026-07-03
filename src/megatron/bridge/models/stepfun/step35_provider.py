@@ -204,3 +204,42 @@ class Step35ModelProvider(GPTModelProvider):
     sliding_attention_setting: dict[str, Any] | None = None
     rotary_base_per_layer: list[float] | None = None
     head_wise_attn_gate: Optional[bool] = False
+
+    # Per-layer lists the bridge fills from the HF config, sized to the *native*
+    # layer count (``num_layers`` decoder layers + ``num_nextn_predict_layers``
+    # MTP layers), with the MTP entries at the tail. ``finalize`` truncates them
+    # to the effective layer count when MTP is reduced/disabled.
+    _PER_LAYER_LIST_FIELDS = (
+        "rotary_base_per_layer",
+        "rotary_percents",
+        "layer_types",
+        "swiglu_limits",
+        "swiglu_limits_shared",
+    )
+
+    def finalize(self) -> None:
+        """Truncate HF-derived per-layer lists to the effective layer count.
+
+        ``Step35Bridge`` / ``Step37Bridge`` populate per-layer lists (per-layer
+        RoPE base and fraction, attention ``layer_types``, SwiGLU clamps) from
+        the HF config with one entry per *native* layer: ``num_layers`` decoder
+        layers followed by ``num_nextn_predict_layers`` (MTP) layers, with the
+        MTP entries at the tail of each list.
+
+        When a recipe/CLI lowers ``mtp_num_layers`` (e.g. ``model.mtp_num_layers=0``
+        to drop MTP for SFT), those trailing MTP entries must be removed so every
+        per-layer list stays consistent with the effective layer count
+        ``num_layers + mtp_num_layers``. Otherwise MCore's ``__post_init__``
+        ``rotary_base_per_layer`` length assertion fires (and the remaining
+        per-layer indexing would silently misalign). Truncating from the tail is
+        correct because the decoder layers occupy the leading ``num_layers`` slots.
+
+        Idempotent: once each list matches the effective length, repeated calls
+        are no-ops.
+        """
+        effective_num_layers = self.num_layers + (self.mtp_num_layers or 0)
+        for field_name in self._PER_LAYER_LIST_FIELDS:
+            value = getattr(self, field_name, None)
+            if isinstance(value, list) and len(value) > effective_num_layers:
+                setattr(self, field_name, value[:effective_num_layers])
+        super().finalize()
