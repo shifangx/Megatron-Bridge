@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from megatron.core.models.gpt.gpt_model import GPTModel
 
@@ -74,6 +74,17 @@ class Step37ModelProvider(Step35ModelProvider):
     # PP / encoder/decoder gating (mirroring Qwen3VLModelProvider).
     add_encoder: bool = True
     add_decoder: bool = True
+
+    # Vision encoder CUDA graph settings (mirroring Qwen3VLModelProvider).
+    # Read by ``build_step37_vision_transformer_config`` to enable TE CUDA
+    # graphs on the MCore vision tower's ``TransformerBlock``. Declared here so
+    # recipe/CLI overrides (``model.vision_cuda_graph_impl=...``) land on the
+    # provider instead of being dropped by the omegaconf override pass.
+    # Set impl to "transformer_engine" to enable; scope e.g. ["attn"] / ["attn","mlp"].
+    vision_cuda_graph_impl: str = "none"
+    vision_cuda_graph_scope: List[str] = field(default_factory=list)
+    # Max vision sequence length for CUDA graph static shapes (None = derive from input).
+    max_vision_cuda_graph_seq_length: Optional[int] = None
 
     def provide(
         self,

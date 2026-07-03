@@ -30,6 +30,8 @@ from typing import Any
 import torch.nn.functional as F
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+from megatron.bridge.utils.cuda_graph import clear_cuda_graph_modules, set_cuda_graph_modules
+
 
 @dataclass
 class Step37TransformerConfig(TransformerConfig):
@@ -88,8 +90,10 @@ def build_step37_vision_transformer_config(vision_cfg: Any, base_config: Transfo
     the same precision as the decoder.
 
     Notes:
-        * ``position_embedding_type="none"`` — the 2D rope is applied manually
-          inside :class:`Step37VisionSelfAttention`, not by MCore.
+        * No ``position_embedding_type`` is set — it is not a core
+          ``TransformerConfig`` field, and MCore's built-in rope is left unused.
+          The 2D rope is applied manually inside
+          :class:`Step37VisionSelfAttention`, not by MCore.
         * ``gated_linear_unit=False`` and biases enabled to match the PE MLP
           (``c_fc``/``c_proj``) and fused ``in_proj``/``out_proj`` layout.
     """
@@ -99,7 +103,7 @@ def build_step37_vision_transformer_config(vision_cfg: Any, base_config: Transfo
     hidden_act = getattr(vision_cfg, "hidden_act", "gelu")
     activation_func = _HIDDEN_ACT_TO_FN.get(hidden_act, F.gelu)
 
-    return TransformerConfig(
+    config = TransformerConfig(
         num_layers=int(vision_cfg.layers),
         hidden_size=width,
         num_attention_heads=heads,
@@ -112,7 +116,6 @@ def build_step37_vision_transformer_config(vision_cfg: Any, base_config: Transfo
         activation_func=activation_func,
         add_bias_linear=True,
         add_qkv_bias=True,
-        position_embedding_type="none",
         apply_rope_fusion=False,
         hidden_dropout=0.0,
         attention_dropout=0.0,
@@ -131,3 +134,31 @@ def build_step37_vision_transformer_config(vision_cfg: Any, base_config: Transfo
         autocast_dtype=getattr(base_config, "autocast_dtype", None),
         pipeline_dtype=getattr(base_config, "pipeline_dtype", None),
     )
+
+    # Vision encoder CUDA graph settings. Mirror qwen_vl's get_vision_model_config:
+    # the provider (``base_config``) carries vision-specific CUDA graph knobs
+    # (``vision_cuda_graph_impl`` / ``vision_cuda_graph_scope`` /
+    # ``max_vision_cuda_graph_seq_length``); translate them onto the vision
+    # ``TransformerConfig`` so the MCore ``TransformerBlock`` captures TE CUDA
+    # graphs. Absent / "none" leaves the tower running eagerly (backward compat).
+    vision_cuda_graph_impl = getattr(base_config, "vision_cuda_graph_impl", "none")
+    if vision_cuda_graph_impl and vision_cuda_graph_impl != "none":
+        config.cuda_graph_impl = vision_cuda_graph_impl
+        vision_scope = getattr(base_config, "vision_cuda_graph_scope", None)
+        if vision_scope:
+            set_cuda_graph_modules(config, vision_scope)
+        else:
+            clear_cuda_graph_modules(config)
+        # Share the decoder's warmup-step count so both graphs warm up together.
+        config.cuda_graph_warmup_steps = getattr(
+            base_config, "cuda_graph_warmup_steps", config.cuda_graph_warmup_steps
+        )
+    else:
+        config.cuda_graph_impl = "none"
+        clear_cuda_graph_modules(config)
+
+    max_vision_seq = getattr(base_config, "max_vision_cuda_graph_seq_length", None)
+    if max_vision_seq is not None:
+        config.max_vision_cuda_graph_seq_length = max_vision_seq
+
+    return config
