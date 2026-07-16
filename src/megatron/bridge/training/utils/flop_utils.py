@@ -26,23 +26,84 @@ from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 _lora_seq_stats_cache: dict = {}
 
 
+def _step37_vit_flops(
+    cfg: ConfigContainer,
+    batch_size: int,
+    num_patches: int | float,
+) -> int | float:
+    """Calculate Step3.7 vision encoder and projector FLOPs."""
+    vision_config = cfg.model.vision_config
+    hidden_size = int(vision_config.width)
+    depth = int(vision_config.layers)
+    intermediate_size = int(hidden_size * vision_config.mlp_ratio)
+    patch_size = int(vision_config.patch_size)
+    num_channels = int(vision_config.num_channels)
+
+    # Recover the per-image patch grid from its patch count so the two
+    # stride-2 downsamplers use their actual output sizes. Released Step3.7
+    # inputs are square; factorization also keeps rectangular counts defined.
+    patch_count = int(round(num_patches))
+    grid_height = max(1, int(patch_count**0.5))
+    while patch_count % grid_height != 0:
+        grid_height -= 1
+    grid_width = patch_count // grid_height
+
+    transformer_tokens = patch_count + int(getattr(vision_config, "use_cls_token", False))
+    transformer_flops = (
+        8 * transformer_tokens * hidden_size**2
+        + 4 * transformer_tokens**2 * hidden_size
+        + 4 * transformer_tokens * hidden_size * intermediate_size
+    ) * depth
+
+    patch_conv_flops = 2 * patch_count * hidden_size * num_channels * patch_size**2
+
+    downsample1_height = (grid_height + 1) // 2
+    downsample1_width = (grid_width + 1) // 2
+    downsample1_flops = (
+        2 * downsample1_height * downsample1_width * (2 * hidden_size) * hidden_size * 3**2
+    )
+
+    downsample2_height = (downsample1_height + 1) // 2
+    downsample2_width = (downsample1_width + 1) // 2
+    downsample2_flops = (
+        2
+        * downsample2_height
+        * downsample2_width
+        * (4 * hidden_size)
+        * (2 * hidden_size)
+        * 3**2
+    )
+
+    projector_flops = (
+        2 * downsample2_height * downsample2_width * (4 * hidden_size) * cfg.model.hidden_size
+    )
+
+    # Frozen modules still execute their forward pass. Trainable modules use
+    # the framework's standard 3x model-FLOPs convention (forward + backward).
+    encoder_multiplier = 1 if getattr(cfg.model, "freeze_vision_model", False) else 3
+    projector_multiplier = 1 if getattr(cfg.model, "freeze_vision_projection", False) else 3
+    encoder_flops = transformer_flops + patch_conv_flops + downsample1_flops + downsample2_flops
+    return batch_size * (encoder_multiplier * encoder_flops + projector_multiplier * projector_flops)
+
+
 def vit_flops(
     cfg: ConfigContainer,
     batch_size: int,
-    num_patches: int,
+    num_patches: int | float,
 ):
-    """Calculate FLOPs for a Vision Transformer (ViT) encoder + patch merger.
+    """Calculate FLOPs for a Vision Transformer (ViT) encoder and projection.
 
-    Includes:
-    - ViT transformer layers (bidirectional full attention, not causal)
-    - Patch merger (spatial merge + MLP projection to LLM hidden size)
+    Includes either:
+    - Step3.7's patch convolution, ViT layers, two convolutional
+      downsamplers, and language projector; or
+    - Generic ViT transformer layers and patch merger.
 
     Args:
-        cfg: Configuration container. ViT hyper-parameters are read from
-            ``cfg.model.vision_config`` (``depth``, ``hidden_size``,
-            ``num_heads``, ``intermediate_size``, ``spatial_merge_size``,
-            ``out_hidden_size``). Passing the whole config keeps the public
-            signature stable as the list of required ViT attributes grows.
+        cfg: Configuration container. Step3.7 is detected by its vision
+            config ``model_type`` and uses ``layers``, ``width``,
+            ``mlp_ratio``, and ``patch_size``. Other ViTs use ``depth``,
+            ``hidden_size``, ``intermediate_size``, ``spatial_merge_size``,
+            and ``out_hidden_size``.
         batch_size: Batch size.
         num_patches: Per-image number of vision patches (before spatial
             merge). Callers that track the total patch count across the
@@ -51,12 +112,17 @@ def vit_flops(
             quadratically with the per-image patch count.
 
     Returns:
-        Total training FLOPs (forward * 3 for fwd+bwd). Returns 0 when
-        no ``vision_config`` is attached or ``num_patches`` is non-positive.
+        Estimated executed model FLOPs. Generic ViTs use the training 3x
+        convention. Step3.7 uses 1x for frozen components and 3x otherwise.
+        Returns 0 when no ``vision_config`` is attached or ``num_patches``
+        is non-positive.
     """
     vision_config = getattr(cfg.model, "vision_config", None)
     if vision_config is None or num_patches <= 0:
         return 0
+
+    if getattr(vision_config, "model_type", None) == "perception_encoder":
+        return _step37_vit_flops(cfg, batch_size, num_patches)
 
     depth = getattr(vision_config, "depth", 0)
     hidden_size = getattr(vision_config, "hidden_size", 0)
@@ -665,16 +731,25 @@ def num_floating_point_operations(
     def _compute_vit_flops():
         """Compute ViT encoder FLOPs if vision config is available.
 
-        Note: num_vision_patches is the *total* patches across the batch.
-        ViT attention is per-image (not cross-image), so we convert to
-        per-image patch count before invoking ``vit_flops`` to get the
-        correct quadratic attention scaling. ``vit_flops`` itself returns
-        0 when ``cfg.model.vision_config`` is absent.
+        ``num_vision_patches`` is the total across the batch, while ViT
+        attention is per-image. Step3.7 mock data exposes a fixed
+        ``dataset.num_images`` used to recover the image count; other vision
+        configs retain the one-image-per-sample convention. The resulting
+        per-image patch count preserves quadratic attention scaling.
+        ``vit_flops`` returns 0 when the vision config is absent.
         """
         if num_vision_patches <= 0:
             return 0
-        patches_per_image = num_vision_patches / batch_size if batch_size > 0 else num_vision_patches
-        return vit_flops(cfg, batch_size, patches_per_image)
+        vision_batch_size = batch_size
+        vision_config = getattr(cfg.model, "vision_config", None)
+        if getattr(vision_config, "model_type", None) == "perception_encoder":
+            num_images_per_sample = getattr(getattr(cfg, "dataset", None), "num_images", 1)
+            if isinstance(num_images_per_sample, int) and num_images_per_sample > 0:
+                vision_batch_size *= num_images_per_sample
+        patches_per_image = (
+            num_vision_patches / vision_batch_size if vision_batch_size > 0 else num_vision_patches
+        )
+        return vit_flops(cfg, vision_batch_size, patches_per_image)
 
     # Main entrypoint for FLOPs calculation.
     if getattr(cfg.model, "is_hybrid_model", False):

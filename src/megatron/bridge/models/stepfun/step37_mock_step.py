@@ -53,6 +53,34 @@ def _images_to_cuda(images: list) -> list:
     return images
 
 
+def _accumulate_flops_metadata(
+    state: GlobalState,
+    tokens: torch.Tensor,
+    images: list,
+) -> None:
+    """Accumulate the actual Step3.7 text and vision work for this microbatch."""
+    micro_batch_size, seq_length = tokens.shape[:2]
+    state._flops_seqlen_sum = getattr(state, "_flops_seqlen_sum", 0) + micro_batch_size * seq_length
+    state._flops_seqlen_sq_sum = (
+        getattr(state, "_flops_seqlen_sq_sum", 0) + micro_batch_size * seq_length**2
+    )
+
+    vision_config = getattr(state.cfg.model, "vision_config", None)
+    patch_size = getattr(vision_config, "patch_size", 0)
+    if not isinstance(patch_size, int) or patch_size <= 0:
+        return
+
+    num_patches = 0
+    for insert_image in images:
+        pixels = getattr(insert_image, "images", None)
+        if not isinstance(pixels, torch.Tensor) or pixels.ndim != 4:
+            continue
+        num_images, _, height, width = pixels.shape
+        num_patches += num_images * (height // patch_size) * (width // patch_size)
+
+    state._flops_vision_patches = getattr(state, "_flops_vision_patches", 0) + num_patches
+
+
 def forward_step(
     state: GlobalState,
     data_iterator: Iterable,
@@ -80,9 +108,11 @@ def forward_step(
     # PP rank 0 owns the embedding + vision fusion, so it needs the tokens and
     # images. Other stages run on the piped hidden states only.
     if is_first and "input_ids" in batch:
-        tokens = batch["input_ids"].to("cuda")
-        forward_args["input_ids"] = tokens
-        forward_args["images"] = _images_to_cuda(batch.get("images") or [])
+        tokens = batch["input_ids"]
+        images = batch.get("images") or []
+        _accumulate_flops_metadata(state, tokens, images)
+        forward_args["input_ids"] = tokens.to("cuda")
+        forward_args["images"] = _images_to_cuda(images)
         forward_args["position_ids"] = None
         # None → the attention backend applies standard causal masking (BSHD).
         forward_args["attention_mask"] = None

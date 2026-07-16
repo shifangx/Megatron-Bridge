@@ -40,6 +40,31 @@ def test_text_config_model_type():
     assert Step37TextConfig.model_type == "step3p5"
 
 
+def test_top_config_accepts_checkpoint_text_fields():
+    layer_types = ["full_attention", "sliding_attention", "sliding_attention", "sliding_attention"] * 12
+    cfg = Step37Config(
+        text_config={
+            "num_hidden_layers": 45,
+            "num_nextn_predict_layers": 3,
+            "layer_types": layer_types,
+            "rope_scaling": {
+                "rope_type": "llama3",
+                "factor": 2.0,
+                "original_max_position_embeddings": 131072,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 32.0,
+            },
+            "rope_theta": 10000,
+            "max_position_embeddings": 262144,
+        },
+    )
+
+    assert cfg.max_position_embeddings == 262144
+    assert cfg.text_config.rope_scaling["rope_type"] == "llama3"
+    assert cfg.text_config.rope_scaling["original_max_position_embeddings"] == 131072
+    assert cfg.text_config.layer_types == layer_types
+
+
 def test_top_config_defaults_and_subconfigs():
     cfg = Step37Config()
     assert cfg.model_type == "step3p7"

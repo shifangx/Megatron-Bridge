@@ -88,6 +88,14 @@ class Step37TextConfig(Step35Config):
 
     model_type = "step3p5"
 
+    def __init__(self, **kwargs: Any) -> None:
+        """Initialize the text config using the Step3.5 schema.
+
+        Transformers 5.8 wraps config subclasses without a class-local
+        initializer, bypassing the inherited Step3.5 field initialization.
+        """
+        super().__init__(**kwargs)
+
 
 class Step37Config(PretrainedConfig):
     """Top-level HF-style config for Step3.7 (the multimodal wrapper)."""

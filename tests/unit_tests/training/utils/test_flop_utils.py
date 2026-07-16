@@ -36,6 +36,21 @@ class MockVisionConfig:
 
 
 @dataclass
+class MockStep37VisionConfig:
+    """Mock Step3.7 perception-encoder config."""
+
+    model_type: str = "perception_encoder"
+    width: int = 1536
+    layers: int = 47
+    heads: int = 16
+    num_channels: int = 3
+    image_size: int = 728
+    mlp_ratio: float = 8960 / 1536
+    patch_size: int = 14
+    use_cls_token: bool = False
+
+
+@dataclass
 class MockModelConfig:
     """Mock model config for testing flop_utils helper functions."""
 
@@ -93,6 +108,8 @@ class MockModelConfig:
     linear_num_value_heads: int = 48
     # Optional ViT vision config (for VLM FLOPS tests)
     vision_config: object | None = None
+    freeze_vision_model: bool = False
+    freeze_vision_projection: bool = False
 
     def __post_init__(self):
         import torch.nn.functional as F
@@ -106,6 +123,7 @@ class MockConfigContainer:
     """Mock ConfigContainer for testing."""
 
     model: MockModelConfig
+    dataset: object | None = None
 
 
 class TestMoELayerFlops:
@@ -1173,6 +1191,50 @@ class TestVitFlops:
         )
         assert vit_flops(cfg_fallback, 1, 16) == vit_flops(cfg_explicit, 1, 16)
 
+    def test_step37_frozen_vision_flops_include_full_execution_path(self):
+        """Step3.7 includes patch/downsampler/projector work at frozen 1x."""
+        vision = MockStep37VisionConfig()
+        cfg = MockConfigContainer(
+            model=MockModelConfig(
+                hidden_size=4096,
+                vision_config=vision,
+                freeze_vision_model=True,
+                freeze_vision_projection=True,
+            )
+        )
+        batch_size = 16
+        patch_count = (vision.image_size // vision.patch_size) ** 2
+        grid1 = vision.image_size // vision.patch_size
+        grid2 = (grid1 + 1) // 2
+        grid3 = (grid2 + 1) // 2
+        intermediate_size = int(vision.width * vision.mlp_ratio)
+
+        transformer = patch_count * vision.layers * (
+            8 * vision.width**2 + 4 * vision.width * patch_count + 4 * vision.width * intermediate_size
+        )
+        patch_conv = 2 * patch_count * vision.width * vision.num_channels * vision.patch_size**2
+        downsampler1 = 2 * grid2**2 * (2 * vision.width) * vision.width * 3**2
+        downsampler2 = 2 * grid3**2 * (4 * vision.width) * (2 * vision.width) * 3**2
+        projector = 2 * grid3**2 * (4 * vision.width) * cfg.model.hidden_size
+        expected = batch_size * (transformer + patch_conv + downsampler1 + downsampler2 + projector)
+
+        assert vit_flops(cfg, batch_size=batch_size, num_patches=patch_count) == expected
+        assert expected / 1e12 == pytest.approx(186.152, abs=0.001)
+
+    def test_step37_trainable_vision_uses_training_multiplier(self):
+        """Unfrozen Step3.7 encoder and projector use the standard 3x convention."""
+        frozen_cfg = MockConfigContainer(
+            model=MockModelConfig(
+                vision_config=MockStep37VisionConfig(),
+                freeze_vision_model=True,
+                freeze_vision_projection=True,
+            )
+        )
+        trainable_cfg = MockConfigContainer(model=MockModelConfig(vision_config=MockStep37VisionConfig()))
+        frozen = vit_flops(frozen_cfg, batch_size=2, num_patches=64)
+        trainable = vit_flops(trainable_cfg, batch_size=2, num_patches=64)
+        assert trainable == 3 * frozen
+
 
 class TestDynamicSeqLenFlops:
     """Unit tests for dynamic-length FLOPS accounting .
@@ -1331,6 +1393,33 @@ class TestDynamicSeqLenFlops:
         cfg = self._llm_cfg()
         baseline = num_floating_point_operations(cfg, batch_size=2)
         assert num_floating_point_operations(cfg, batch_size=2, num_vision_patches=0) == baseline
+
+    def test_step37_multiple_images_use_per_image_patch_count(self):
+        """Step3.7 mock batches must not merge multiple images into one attention sequence."""
+        cfg = MockConfigContainer(
+            model=MockModelConfig(
+                vision_config=MockStep37VisionConfig(
+                    width=128,
+                    layers=2,
+                    image_size=112,
+                    mlp_ratio=2,
+                    patch_size=14,
+                ),
+                freeze_vision_model=True,
+                freeze_vision_projection=True,
+            ),
+            dataset=SimpleNamespace(num_images=2),
+        )
+        batch_size = 3
+        patches_per_image = 64
+        llm_only = num_floating_point_operations(cfg, batch_size=batch_size)
+        with_vision = num_floating_point_operations(
+            cfg,
+            batch_size=batch_size,
+            num_vision_patches=batch_size * 2 * patches_per_image,
+        )
+        expected_vision = vit_flops(cfg, batch_size=batch_size * 2, num_patches=patches_per_image)
+        assert with_vision - llm_only == expected_vision
 
 
 @pytest.mark.unit

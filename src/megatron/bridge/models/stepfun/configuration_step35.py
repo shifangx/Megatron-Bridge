@@ -170,4 +170,30 @@ class Step35Config(PretrainedConfig):
         self.use_head_wise_attn_gate = use_head_wise_attn_gate
         self.sliding_window = sliding_window
         self.num_nextn_predict_layers = num_nextn_predict_layers
+
+        native_layer_types = self.layer_types
+        expected_num_layers = num_hidden_layers + num_nextn_predict_layers
+        if native_layer_types is not None and len(native_layer_types) == expected_num_layers:
+            # Transformers 5.8 validates only against the main decoder count.
+            self.layer_types = native_layer_types[:num_hidden_layers]
         super().__init__(**kwargs)
+        self.layer_types = native_layer_types
+        self.validate_layer_type()
+
+    def validate_layer_type(self) -> None:
+        """Validate layer types including MTP layers appended after the decoder.
+
+        Transformers expects one entry per main decoder layer. Step3.5/3.7
+        checkpoints also include one entry per next-token-prediction layer.
+        """
+        if self.layer_types is None:
+            return
+
+        num_hidden_layers = self.num_hidden_layers
+        expected_num_layers = num_hidden_layers + self.num_nextn_predict_layers
+        if len(self.layer_types) == expected_num_layers:
+            self.num_hidden_layers = expected_num_layers
+        try:
+            super().validate_layer_type()
+        finally:
+            self.num_hidden_layers = num_hidden_layers
