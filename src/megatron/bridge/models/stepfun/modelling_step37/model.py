@@ -292,7 +292,7 @@ class Step37Model(MegatronModule):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
         images: Optional[list[ImageForInsert]] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
@@ -310,9 +310,9 @@ class Step37Model(MegatronModule):
         """Step3.7 forward.
 
         Args:
-            input_ids: ``[1, T]`` packed token ids (the flickr8k pipeline
-                always feeds ``B=1`` because per-pack sub-sequences are
-                demarcated by ``cu_seqlens``).
+            input_ids: ``[1, T]`` packed token ids on the first pipeline
+                stage. Non-first pipeline stages receive their hidden states
+                through :meth:`set_input_tensor`, so this is ``None`` there.
             images: pre-encoded or raw ``list[ImageForInsert]``. Each item's
                 ``insert_start_token`` points at the placeholder token id
                 (e.g. ``<im_start>``) used by ``insert_features`` to locate
@@ -333,6 +333,8 @@ class Step37Model(MegatronModule):
         combined_embeddings = None
 
         if self.pre_process:
+            if input_ids is None:
+                raise ValueError("input_ids is required on the first pipeline stage")
             nvtx_range_push(suffix="encode_images_for_insert")
             # 1) Vision encode: list[ImageForInsert]/raw → list[ImageForInsert]/encoded
             processed_images = self._encode_images_for_insert(images)
