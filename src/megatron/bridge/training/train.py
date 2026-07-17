@@ -411,12 +411,10 @@ def train(
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
         # Capture Vision Encoder CUDA Graphs after warmup (separate from language model).
         if (
-            vision_cuda_graph_helper is not None
-            and not vision_cuda_graph_helper.graphs_created()
+            vision_config == "transformer_engine"
             and global_state.train_state.step - start_iteration == model_config.cuda_graph_warmup_steps
         ):
-            vision_cuda_graph_helper.create_cudagraphs()
-            vision_cuda_graph_helper.cuda_graph_set_manual_hooks()
+            _capture_vision_cuda_graphs(vision_cuda_graph_helper)
 
         # Run training step.
         fault_tolerance.on_training_step_start(global_state)
@@ -1649,6 +1647,30 @@ def _delete_cuda_graphs(cuda_graph_helper: TECudaGraphHelper):
 
     # Run GC to collect the freshed object
     gc.collect()
+
+
+def _capture_vision_cuda_graphs(
+    vision_cuda_graph_helper: Optional[VisionTECudaGraphHelper],
+) -> None:
+    """Collectively capture Vision CUDA Graphs when Vision exists only on some PP stages.
+
+    MCore's ``VisionTECudaGraphHelper.create_cudagraphs`` finishes with a WORLD
+    barrier. With pipeline parallelism, only the first pipeline stage owns the
+    Vision encoder and creates a helper. Ranks on all other pipeline stages
+    must therefore enter a matching barrier or the capture deadlocks.
+
+    The second barrier keeps non-Vision ranks from starting the next training
+    step until Vision ranks have completed post-capture cleanup and installed
+    their manual hooks.
+    """
+    if vision_cuda_graph_helper is None:
+        # Match the WORLD barrier inside VisionTECudaGraphHelper._finish_capturing().
+        torch.distributed.barrier()
+    else:
+        vision_cuda_graph_helper.create_cudagraphs()
+        vision_cuda_graph_helper.cuda_graph_set_manual_hooks()
+
+    torch.distributed.barrier()
 
 
 def _maybe_register_fsdp_buffers(

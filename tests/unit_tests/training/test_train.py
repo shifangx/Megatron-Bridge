@@ -23,6 +23,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataPa
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
 from megatron.bridge.training.train import (
+    _capture_vision_cuda_graphs,
     _dummy_train_step,
     _handle_mxfp8_param_buffer_copy,
     _maybe_register_fsdp_buffers,
@@ -40,6 +41,33 @@ from megatron.bridge.training.utils.train_utils import maybe_inject_state
 
 
 pytestmark = pytest.mark.unit
+
+
+class TestVisionCudaGraphCapture:
+    """Tests for PP-safe Vision CUDA Graph capture synchronization."""
+
+    @patch("megatron.bridge.training.train.torch.distributed.barrier")
+    def test_vision_rank_pairs_internal_barrier_and_waits_after_cleanup(self, mock_barrier):
+        helper = Mock()
+        events = []
+        mock_barrier.side_effect = lambda: events.append("barrier")
+        helper.create_cudagraphs.side_effect = lambda: (
+            events.append("capture"),
+            mock_barrier(),
+        )
+        helper.cuda_graph_set_manual_hooks.side_effect = lambda: events.append("hooks")
+
+        _capture_vision_cuda_graphs(helper)
+
+        assert events == ["capture", "barrier", "hooks", "barrier"]
+        helper.create_cudagraphs.assert_called_once_with()
+        helper.cuda_graph_set_manual_hooks.assert_called_once_with()
+
+    @patch("megatron.bridge.training.train.torch.distributed.barrier")
+    def test_non_vision_rank_matches_capture_barrier_and_waits_for_cleanup(self, mock_barrier):
+        _capture_vision_cuda_graphs(None)
+
+        assert mock_barrier.call_count == 2
 
 
 class TestFSDPRegistration:
