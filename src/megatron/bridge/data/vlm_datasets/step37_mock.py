@@ -47,6 +47,8 @@ from typing import Any, Literal, Optional, Tuple
 
 import numpy
 import torch
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 from megatron.bridge.data.vlm_datasets.step37_flickr8k.template import (
     IMAGE_END_TOKEN,
@@ -61,18 +63,28 @@ from megatron.bridge.training.config import DatasetBuildContext, DatasetProvider
 class _Step37MockDataset(torch.utils.data.Dataset):
     """Map-style dataset that synthesizes Step3.7 BSHD SFT rows on the fly.
 
-    ``__getitem__`` returns one sample dict::
+    ``__getitem__`` returns one sample dict whose keys depend on which
+    **pipeline stage** owns the current rank (see ``load_inputs`` /
+    ``load_labels``). At most::
 
         {
-            "input_ids": LongTensor[S],   # tokens[:-1]
-            "labels":    LongTensor[S],   # tokens[1:]
-            "loss_mask": FloatTensor[S],  # 1.0 on the response span only
-            "image":     FloatTensor[num_images, 3, H, W],
+            "input_ids": LongTensor[S],   # tokens[:-1]  (first PP stage)
+            "labels":    LongTensor[S],   # tokens[1:]   (last PP stage)
+            "loss_mask": FloatTensor[S],  # 1.0 on the response span only (last PP stage)
+            "image":     FloatTensor[num_images, 3, H, W],  # (first PP stage)
         }
 
-    and exposes ``collate_fn`` so the mbridge dataloader turns a list of
-    ``micro_batch_size`` rows into a single ``[B, S]`` batch plus one merged
-    ``list[ImageForInsert]``.
+    Under pipeline parallelism only the first stage runs the embedding + vision
+    fusion (so it needs ``input_ids`` + ``image``) and only the last stage
+    computes the loss (so it needs ``labels`` + ``loss_mask``). Middle stages
+    operate on piped hidden states alone and therefore synthesize **nothing** —
+    this in particular skips the expensive ``[num_images, 3, H, W]`` random
+    image tensor on every rank that would only throw it away. See
+    ``step37_mock_step.forward_step`` for the consuming side.
+
+    ``collate_fn`` mirrors this: it only stacks the keys that are present, so a
+    middle-stage batch is an empty payload (with an empty ``images`` list) that
+    still advances the sampler in lockstep with the other stages.
     """
 
     def __init__(
@@ -91,9 +103,15 @@ class _Step37MockDataset(torch.utils.data.Dataset):
         prompt_length: int,
         response_length: int,
         random_seed: int,
+        load_inputs: bool = True,
+        load_labels: bool = True,
     ) -> None:
         super().__init__()
         self._length = int(max(0, length))
+        # PP-stage gating: first stage needs input_ids + image; last stage needs
+        # labels + loss_mask; middle stages need neither.
+        self.load_inputs = bool(load_inputs)
+        self.load_labels = bool(load_labels)
         self.seq_length = int(seq_length)
         self.num_images = int(num_images)
         self.image_size = int(image_size)
@@ -140,57 +158,79 @@ class _Step37MockDataset(torch.utils.data.Dataset):
         # Deterministic per-index streams keep every DP rank / worker in sync.
         rng = numpy.random.default_rng(seed=self.random_seed + int(idx))
 
-        full_len = self.seq_length + 1
-        tokens: list[int] = []
-        loss: list[float] = []
+        sample: dict[str, Any] = {}
 
-        # 1) Image spans (never contribute to the loss).
-        for _ in range(self.num_images):
-            tokens.append(self.img_start_token_id)
-            tokens.extend([self.img_patch_token_id] * self.image_token_count)
-            tokens.append(self.img_end_token_id)
-        loss.extend([0.0] * self._image_block_len)
+        # The token stream is only synthesized when this PP stage consumes it —
+        # the first stage reads ``input_ids`` and the last stage reads
+        # ``labels`` / ``loss_mask`` (both are shifts of the same stream, so the
+        # RNG draws stay identical and first/last stay aligned). Middle stages
+        # skip it entirely. The image draw comes *after* the text draws, so a
+        # stage that skips the image never perturbs the token stream.
+        if self.load_inputs or self.load_labels:
+            full_len = self.seq_length + 1
+            tokens: list[int] = []
+            loss: list[float] = []
 
-        # 2) Prompt text (masked out of the loss).
-        prompt = self._text_tokens(rng, self.prompt_length)
-        tokens.extend(prompt)
-        loss.extend([0.0] * len(prompt))
+            # 1) Image spans (never contribute to the loss).
+            for _ in range(self.num_images):
+                tokens.append(self.img_start_token_id)
+                tokens.extend([self.img_patch_token_id] * self.image_token_count)
+                tokens.append(self.img_end_token_id)
+            loss.extend([0.0] * self._image_block_len)
 
-        # 3) Response text (the only supervised span).
-        response = self._text_tokens(rng, self.response_length)
-        tokens.extend(response)
-        loss.extend([1.0] * len(response))
+            # 2) Prompt text (masked out of the loss).
+            prompt = self._text_tokens(rng, self.prompt_length)
+            tokens.extend(prompt)
+            loss.extend([0.0] * len(prompt))
 
-        # 4) Right-pad to the shifted length.
-        pad = full_len - len(tokens)
-        if pad > 0:
-            tokens.extend([self.pad_token_id] * pad)
-            loss.extend([0.0] * pad)
+            # 3) Response text (the only supervised span).
+            response = self._text_tokens(rng, self.response_length)
+            tokens.extend(response)
+            loss.extend([1.0] * len(response))
 
-        full_tokens = torch.tensor(tokens[:full_len], dtype=torch.long)
-        full_loss = torch.tensor(loss[:full_len], dtype=torch.float32)
+            # 4) Right-pad to the shifted length.
+            pad = full_len - len(tokens)
+            if pad > 0:
+                tokens.extend([self.pad_token_id] * pad)
+                loss.extend([0.0] * pad)
 
-        image = None
-        if self.num_images > 0:
-            image = torch.from_numpy(
+            full_tokens = torch.tensor(tokens[:full_len], dtype=torch.long)
+            full_loss = torch.tensor(loss[:full_len], dtype=torch.float32)
+
+            if self.load_inputs:
+                sample["input_ids"] = full_tokens[:-1].contiguous()
+            if self.load_labels:
+                sample["labels"] = full_tokens[1:].contiguous()
+                sample["loss_mask"] = full_loss[1:].contiguous()
+
+        # Vision pixels are consumed only by the first PP stage (embedding +
+        # vision fusion). Never materialize the heavy tensor on stages that
+        # would discard it.
+        if self.load_inputs and self.num_images > 0:
+            sample["image"] = torch.from_numpy(
                 rng.standard_normal(
                     size=(self.num_images, 3, self.image_size, self.image_size),
                     dtype=numpy.float32,
                 )
             )
 
-        return {
-            "input_ids": full_tokens[:-1].contiguous(),
-            "labels": full_tokens[1:].contiguous(),
-            "loss_mask": full_loss[1:].contiguous(),
-            "image": image,
-        }
+        return sample
 
     def collate_fn(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
-        """Stack ``[B, S]`` tensors and merge per-row pixels into one insert."""
-        input_ids = torch.stack([b["input_ids"] for b in batch], dim=0)
-        labels = torch.stack([b["labels"] for b in batch], dim=0)
-        loss_mask = torch.stack([b["loss_mask"] for b in batch], dim=0)
+        """Stack ``[B, S]`` tensors and merge per-row pixels into one insert.
+
+        Only the keys the current PP stage synthesized are stacked, so a
+        middle-stage batch carries just an empty ``images`` list. The consuming
+        ``forward_step`` guards on ``"input_ids" in batch`` / ``"labels" in
+        batch``, so omitting a key on the stages that do not need it is safe.
+        """
+        out: dict[str, Any] = {}
+
+        if batch and all("input_ids" in b for b in batch):
+            out["input_ids"] = torch.stack([b["input_ids"] for b in batch], dim=0)
+        if batch and all("labels" in b for b in batch):
+            out["labels"] = torch.stack([b["labels"] for b in batch], dim=0)
+            out["loss_mask"] = torch.stack([b["loss_mask"] for b in batch], dim=0)
 
         images: list[ImageForInsert] = []
         pixels = [b["image"] for b in batch if b.get("image") is not None]
@@ -203,13 +243,9 @@ class _Step37MockDataset(torch.utils.data.Dataset):
                     images=torch.cat(pixels, dim=0),
                 )
             )
+        out["images"] = images
 
-        return {
-            "input_ids": input_ids,
-            "labels": labels,
-            "loss_mask": loss_mask,
-            "images": images,
-        }
+        return out
 
 
 @dataclass(kw_only=True)
@@ -286,7 +322,22 @@ class Step37MockSFTDataProvider(DatasetProvider):
         if self.img_end_token_id < 0:
             self.img_end_token_id = int(tok.convert_tokens_to_ids(self.image_end_token))
 
-    def _make_dataset(self, size: int) -> Optional[_Step37MockDataset]:
+    @staticmethod
+    def _resolve_pp_stage(pg_collection: Optional[ProcessGroupCollection]) -> Tuple[bool, bool]:
+        """Return ``(is_first_pp_stage, is_last_pp_stage)`` for this rank.
+
+        Falls back to ``(True, True)`` when no pipeline process group is
+        available (e.g. unit tests or single-stage runs), which reproduces the
+        original "synthesize everything" behavior.
+        """
+        pp = getattr(pg_collection, "pp", None) if pg_collection is not None else None
+        if pp is None:
+            return True, True
+        return is_pp_first_stage(pp), is_pp_last_stage(pp)
+
+    def _make_dataset(
+        self, size: int, *, load_inputs: bool, load_labels: bool
+    ) -> Optional[_Step37MockDataset]:
         if not size or size <= 0:
             return None
         return _Step37MockDataset(
@@ -303,16 +354,25 @@ class Step37MockSFTDataProvider(DatasetProvider):
             prompt_length=self.prompt_length,
             response_length=self.response_length,
             random_seed=self.random_seed,
+            load_inputs=load_inputs,
+            load_labels=load_labels,
         )
 
     def build_datasets(
         self, context: DatasetBuildContext
     ) -> Tuple[Optional[Any], Optional[Any], Optional[Any]]:
-        """Build synthetic train / valid / test datasets in BSHD layout."""
+        """Build synthetic train / valid / test datasets in BSHD layout.
+
+        Each rank only synthesizes the slice its pipeline stage consumes: the
+        first PP stage gets ``input_ids`` + ``image``, the last PP stage gets
+        ``labels`` + ``loss_mask``, and middle stages get an empty payload.
+        """
         self._resolve_from_tokenizer()
-        train_ds = self._make_dataset(context.train_samples)
-        valid_ds = self._make_dataset(context.valid_samples)
-        test_ds = self._make_dataset(context.test_samples)
+        is_first, is_last = self._resolve_pp_stage(context.pg_collection)
+        make = lambda size: self._make_dataset(size, load_inputs=is_first, load_labels=is_last)
+        train_ds = make(context.train_samples)
+        valid_ds = make(context.valid_samples)
+        test_ds = make(context.test_samples)
         return train_ds, valid_ds, test_ds
 
 
