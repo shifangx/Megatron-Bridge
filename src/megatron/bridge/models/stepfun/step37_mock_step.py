@@ -133,12 +133,17 @@ def forward_step(
             assert model.config.overlap_moe_expert_parallel_comm, (
                 "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
             )
+            # Pass images + position_ids by keyword: Step37Model.build_schedule_plan
+            # runs the (frozen) vision tower + fusion eagerly to produce the
+            # decoder_input, then delegates to the inner GPTModel's schedule plan.
             schedule_plan = model.build_schedule_plan(
-                forward_args.get("input_ids"),
-                None,
-                forward_args.get("attention_mask"),
+                input_ids=forward_args.get("input_ids"),
+                images=forward_args.get("images"),
+                position_ids=forward_args.get("position_ids"),
+                attention_mask=forward_args.get("attention_mask"),
                 labels=forward_args.get("labels"),
                 loss_mask=forward_args.get("loss_mask"),
+                packed_seq_params=forward_args.get("packed_seq_params"),
             )
             loss_function = _create_loss_function(loss_mask, check_for_nan_in_loss, check_for_spiky_loss)
             return schedule_plan, loss_function

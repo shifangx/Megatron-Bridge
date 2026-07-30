@@ -367,5 +367,65 @@ class Step37Model(MegatronModule):
         nvtx_range_pop(suffix="language_model")
         return output
 
+    # ─── EP A2A overlap schedule plan ───────────────────────────────────────────
+
+    def build_schedule_plan(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        images: Optional[list[ImageForInsert]] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        loss_mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        extra_block_kwargs: Optional[dict] = None,
+        runtime_gather_output: bool | None = None,
+        **kwargs,
+    ):
+        """Build the EP-A2A-overlap schedule plan for the Step3.7 VLM.
+
+        This mirrors :meth:`forward` but, instead of running the language model
+        eagerly, returns the inner :class:`Step37GPTModel`'s
+        ``TransformerModelChunkSchedulePlan`` so the combined-1f1b scheduler can
+        overlap the decoder's MoE all-to-all with compute.
+
+        The vision tower and vision-text fusion are run eagerly here: they are
+        frozen and sit outside the overlapped decoder schedule, so they simply
+        produce ``decoder_input`` (the fused ``[S, B, H]`` embedding) that is
+        handed to the language model's schedule plan. On non-first pipeline
+        stages ``pre_process`` is False, so ``decoder_input`` stays ``None`` and
+        the plan picks up the piped hidden states via ``decoder.input_tensor``
+        (same as :meth:`forward`).
+        """
+        combined_embeddings = None
+
+        if self.pre_process:
+            if input_ids is None:
+                raise ValueError("input_ids is required on the first pipeline stage")
+            nvtx_range_push(suffix="encode_images_for_insert")
+            processed_images = self._encode_images_for_insert(images)
+            nvtx_range_pop(suffix="encode_images_for_insert")
+
+            nvtx_range_push(suffix="forward_head")
+            combined_embeddings = self.forward_head(
+                input_ids=input_ids,
+                images=processed_images,
+                position_ids=position_ids,
+            )
+            nvtx_range_pop(suffix="forward_head")
+
+        return self.language_model.build_schedule_plan(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=combined_embeddings,
+            labels=labels,
+            loss_mask=loss_mask,
+            packed_seq_params=packed_seq_params,
+            extra_block_kwargs=extra_block_kwargs,
+            runtime_gather_output=runtime_gather_output,
+            **kwargs,
+        )
+
 
 __all__ = ["Step37Model"]
