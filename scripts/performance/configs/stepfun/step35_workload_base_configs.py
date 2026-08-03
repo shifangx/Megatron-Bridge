@@ -189,6 +189,7 @@ STEP35_196B_A11B_PRETRAIN_CONFIG_GB200_FP8_MX_V2 = replace(
     cuda_graph_scope=[],
     cutedsl_fused_grouped_mlp=True,
     fp8_dot_product_attention=True,
+    mtp_num_layers=1,
     # Explicit PP=8 / VPP=3 layout for the 45 decoder layers (24 virtual stages).
     # First stage = 1 layer (+embedding), last two stages = 1 layer each; the
     # remaining 21 stages hold 2 layers each -> 1 + 21*2 + 1 + 1 = 45.
