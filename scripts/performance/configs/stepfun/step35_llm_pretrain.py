@@ -49,7 +49,9 @@ logger = logging.getLogger(__name__)
 # Step-3.5-Flash has 45 decoder layers. PP=8 does not divide 45, so a fixed
 # uneven split is required (6 + 6*6 + 3 = 45). This matches the validated
 # Step-3.7 sbatch (num_layers_in_first_pipeline_stage=6 /
-# num_layers_in_last_pipeline_stage=3). All presets below use PP=8.
+# num_layers_in_last_pipeline_stage=3). All presets below use PP=8. Presets that
+# instead carry an explicit VPP pp_layout (e.g. GB200 FP8_MX V2) override this
+# fixed split in _build (the two are mutually exclusive).
 _NUM_LAYERS_IN_FIRST_PP_STAGE = 6
 _NUM_LAYERS_IN_LAST_PP_STAGE = 3
 
@@ -120,6 +122,14 @@ def _build(gpu: str, precision: str, config_variant: str, *, tp_comm_overlap: bo
 
     set_step35_common_configs(cfg)
     set_workload_base_configs(cfg, base_cfg)
+    # A preset may carry an explicit VPP pp_layout string (e.g. GB200 FP8_MX V2).
+    # That string fully specifies the per-virtual-stage layer split, so it replaces
+    # the fixed uneven first/last split from set_step35_common_configs -- the two are
+    # mutually exclusive. VPP itself is applied by set_workload_base_configs.
+    if base_cfg.pp_layout:
+        cfg.model.pipeline_model_parallel_layout = base_cfg.pp_layout
+        cfg.model.num_layers_in_first_pipeline_stage = None
+        cfg.model.num_layers_in_last_pipeline_stage = None
     if precision == "fp8_mx" and is_full_iteration_cuda_graph(cfg.model):
         set_full_iter_cg_configs(cfg)
 

@@ -28,11 +28,14 @@ V2: Blackwell num_gpus=256 (PP=8, EP=32),  GBS=8192
 Large-scale proxy: GBS=512
 
 IMPORTANT — 45-layer constraints (enforced in step35_llm_pretrain.py):
-  * PP=8 does not divide 45, so the builder sets
+  * PP=8 does not divide 45, so by default the builder sets
     num_layers_in_first_pipeline_stage=6 / num_layers_in_last_pipeline_stage=3
     (6 + 6*6 + 3 = 45), matching the validated Step-3.7 sbatch layout.
-  * virtual_pipeline_model_parallel_size stays None everywhere (45 is not
-    divisible by PP*VPP; enabling VPP would require an explicit pp_layout).
+  * virtual_pipeline_model_parallel_size stays None by default (45 is not
+    divisible by PP*VPP; enabling VPP requires an explicit pp_layout). The
+    GB200 FP8_MX V2 preset is the exception: it sets VPP=3 with an explicit
+    pp_layout ("Et|(t*2|)*21t|tL", 24 virtual stages), and the builder then
+    clears the fixed first/last split in favor of that layout.
 
 These presets mirror the Qwen3-235B tuning as a *starting point*; the exact
 per-GPU/precision knobs should be perf-validated for Step-3.5.
@@ -186,6 +189,12 @@ STEP35_196B_A11B_PRETRAIN_CONFIG_GB200_FP8_MX_V2 = replace(
     cuda_graph_scope=[],
     cutedsl_fused_grouped_mlp=True,
     fp8_dot_product_attention=True,
+    # Explicit PP=8 / VPP=3 layout for the 45 decoder layers (24 virtual stages).
+    # First stage = 1 layer (+embedding), last two stages = 1 layer each; the
+    # remaining 21 stages hold 2 layers each -> 1 + 21*2 + 1 + 1 = 45.
+    # This replaces the default fixed 6/3 first/last split (see step35_llm_pretrain).
+    virtual_pipeline_model_parallel_size=3,
+    pp_layout="Et|(t*2|)*21t|tL",
 )
 STEP35_196B_A11B_PRETRAIN_CONFIG_GB200_NVFP4_V2 = STEP35_196B_A11B_PRETRAIN_CONFIG_GB200_FP8_CS_V2
 
