@@ -80,6 +80,13 @@ def set_step35_common_configs(cfg: ConfigContainer) -> None:
     # Dropless MoE requires forced load balancing for the flex dispatcher.
     cfg.model.moe_router_force_load_balancing = True
 
+    # Multi-Token Prediction: use a single MTP layer for every Step-3.5 perf run.
+    # The HF checkpoint ships num_nextn_predict_layers=3 (AutoBridge maps it onto
+    # mtp_num_layers), but the perf/training recipe standardizes on 1. Presets that
+    # carry an explicit pp_layout (e.g. GB200 FP8_MX V2) encode exactly one `m`
+    # token to match this.
+    cfg.model.mtp_num_layers = 1
+
     # 45-layer uneven pipeline split (PP=8). VPP stays None (see module docstring).
     cfg.model.virtual_pipeline_model_parallel_size = None
     cfg.model.pipeline_model_parallel_layout = None
