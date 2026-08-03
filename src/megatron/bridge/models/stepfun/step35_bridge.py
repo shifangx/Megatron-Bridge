@@ -133,7 +133,7 @@ class _MTPDenseLayerSpecsList(list):
         return super().__getitem__(idx)
 
 
-def _build_step35_layer_spec(cfg, **kw):
+def _build_step35_layer_spec(cfg, vp_stage=None, **kw):
     """Per-layer spec for Step3.5: dense for layers 0-2 and 45-47, MoE for 3-44.
 
     Also rewrites every main-decoder layer's ModuleSpec to use
@@ -144,8 +144,16 @@ def _build_step35_layer_spec(cfg, **kw):
     Returns a TransformerBlockSubmodules whose layer_specs list is wrapped in
     _MTPDenseLayerSpecsList so that get_gpt_mtp_block_spec_for_backend receives
     a dense ModuleSpec (via layer_specs[-1]) for the MTP transformer sub-layers.
+
+    ``vp_stage`` is named explicitly (rather than swallowed by ``**kw``) so the
+    GPTModelProvider's ``"vp_stage" in signature(...).parameters`` introspection
+    forwards the virtual-pipeline stage; it is required by
+    ``get_num_layers_to_build`` whenever VPP is combined with an explicit
+    ``pipeline_model_parallel_layout``.
     """
-    block_submodules = get_gpt_decoder_block_spec(cfg, use_transformer_engine=True, normalization="RMSNorm", **kw)
+    block_submodules = get_gpt_decoder_block_spec(
+        cfg, use_transformer_engine=True, normalization="RMSNorm", vp_stage=vp_stage, **kw
+    )
     # Swap the layer module class on every main-decoder spec. The dense MTP
     # spec below is used for MTP layers (which have their own 1-indexed
     # layer_number namespace) so the routed-expert FFN stays disabled even
