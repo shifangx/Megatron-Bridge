@@ -54,6 +54,7 @@ from megatron.bridge.models.stepfun.step35_bridge import (
     StackedExpertAutoMapping,
     StackedExpertGatedMLPMapping,
     Step35Bridge,
+    _mcore_supports_head_wise_attn_gate,
     build_step35_layer_spec,
 )
 from megatron.bridge.models.stepfun.step37_provider import Step37ModelProvider
@@ -288,6 +289,14 @@ class Step37Bridge(MegatronModelBridge):
         # Head-wise attention gate (default is True for Step3.7 text config).
         head_wise_attn_gate = bool(getattr(text_config, "use_head_wise_attn_gate", True))
         provider.head_wise_attn_gate = head_wise_attn_gate
+
+        if getattr(provider, "head_wise_attn_gate", False):
+            # Native head-wise gates and the full-head output gate are mutually
+            # exclusive; MCore without native support needs the output-gate
+            # fallback (mirrors Step35Bridge). Without this, linear_qkv is sized
+            # for Q+K+V only while QKVGMapping emits Q+K+V+G, so weight loading
+            # fails with a per-head-gate shape mismatch on every layer.
+            provider.attention_output_gate = not _mcore_supports_head_wise_attn_gate()
 
         # ── 3. Step3.7 multimodal / vision fields ───────────────────────────
         provider.vision_config = vision_config
