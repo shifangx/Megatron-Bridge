@@ -229,6 +229,11 @@ class ImageInsertEmbedding(nn.Module):
             if isinstance(image_features, torch.Tensor):
                 image_features = image_features.to(device=target_device, dtype=target_dtype)
                 image_features = self.align_projector(image_features)
+                # Dump the projected image features (LLM hidden dim) — matches
+                # the vLLM reference "vit_projector_out" tag ([B, 169, 4096]).
+                from megatron.bridge.models.stepfun.modelling_step37._dump import dump_tensor
+
+                dump_tensor("vit_projector_out", image_features, enable_env="STEP3P7_DUMP_VIT", max_calls=1)
             else:
                 image_features = [
                     self.align_projector(feature.to(device=target_device, dtype=target_dtype))

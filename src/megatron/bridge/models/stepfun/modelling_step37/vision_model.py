@@ -33,6 +33,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from megatron.bridge.models.stepfun.modelling_step37._dump import dump_tensor
 from megatron.bridge.models.stepfun.modelling_step37.utils import (
     EncoderVisionTransformer,
 )
@@ -203,6 +204,10 @@ class Step37VisionModel(nn.Module):
         if self.use_cls_token:
             hidden_state = hidden_state[:, 1:, :]
 
+        # Dump the raw ViT trunk output (post ln_post, CLS dropped) — matches
+        # the vLLM reference "vit_features" tag ([B, P, width], P=2704 @ 728²).
+        dump_tensor("vit_features", hidden_state, enable_env="STEP3P7_DUMP_VIT", max_calls=1)
+
         # Spatial reshape + 2× downsampler, producing the final
         # ``[B, P', output_dim]`` image features in a single forward call.
         B, P = hidden_state.shape[:2]
@@ -213,4 +218,8 @@ class Step37VisionModel(nn.Module):
 
         B, C, HW, _ = image_features.shape
         image_features = image_features.view(B, -1, HW * HW).permute(0, 2, 1)
+
+        # Dump the downsampled features (before align_projector) — matches the
+        # vLLM reference "vit_downsampled" tag ([B, 169, width*4=6144] @ 728²).
+        dump_tensor("vit_downsampled", image_features, enable_env="STEP3P7_DUMP_VIT", max_calls=1)
         return image_features
