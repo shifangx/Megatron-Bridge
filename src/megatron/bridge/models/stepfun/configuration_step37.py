@@ -88,6 +88,15 @@ class Step37TextConfig(Step35Config):
 
     model_type = "step3p5"
 
+    def __init__(self, **kwargs):
+        # transformers v5's PreTrainedConfig.__init_subclass__ auto-synthesizes an
+        # __init__ for subclasses that do NOT declare one, and that synthesized
+        # __init__ bypasses Step35Config.__init__ — leaving hidden_size and the
+        # other Step-3.5 fields unset on default construction (which breaks
+        # to_diff_dict()/__repr__). Declaring an explicit __init__ that forwards
+        # to Step35Config keeps the real initializer in the chain.
+        super().__init__(**kwargs)
+
 
 class Step37Config(PretrainedConfig):
     """Top-level HF-style config for Step3.7 (the multimodal wrapper)."""

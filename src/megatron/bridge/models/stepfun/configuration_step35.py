@@ -93,12 +93,6 @@ class Step35Config(PretrainedConfig):
 
     model_type = "step3p5"
     architectures = ["Step3p5ForCausalLM"]
-    # Class-level fallback so transformers' RoPE standardization in
-    # PretrainedConfig.__post_init__ (standardize_rope_params) can read
-    # self.max_position_embeddings before the instance attribute is set.
-    # The instance value (from config.json / __init__) overrides this; it only
-    # prevents an AttributeError when rope_scaling is present (e.g. Step3.7).
-    max_position_embeddings = 262144
 
     def __init__(
         self,
