@@ -641,6 +641,10 @@ def main(
         [
             f"{run_script_path}:{run_script_path}",
             f"{SCRIPT_DIR}:{SCRIPT_DIR}",
+            # scripts/performance imports shared helpers (e.g.
+            # benchmark_parallelism) from scripts/common via sys.path, so the
+            # sibling common/ dir must be bind-mounted alongside performance/.
+            f"{SCRIPT_DIR.parent / 'common'}:{SCRIPT_DIR.parent / 'common'}",
             _bridge_source_mount(in_container_script_dir),
         ]
     )
