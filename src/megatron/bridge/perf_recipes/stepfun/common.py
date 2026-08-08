@@ -38,6 +38,19 @@ _STEP35_PP4_VPP3_LAYOUT = "Et*3|(t*4|)*10t*2mL"
 _STEP35_PP4_VPP3_PP_SIZE = 4
 _STEP35_PP4_VPP3_VPP_SIZE = 3
 
+# Step-3.5 per-layer overrides that ``Step35TransformerLayer`` indexes by the
+# *global* 0-indexed layer id. MTP layers sit right after the decoder layers
+# (indices ``num_layers .. num_layers + mtp_num_layers - 1``), so each of these
+# lists is sized ``num_layers + mtp_num_layers`` when it comes from the HF
+# config and must be resized in lockstep with ``mtp_num_layers``.
+_STEP35_PER_LAYER_FIELDS = (
+    "rotary_base_per_layer",
+    "rotary_percents",
+    "layer_types",
+    "swiglu_limits",
+    "swiglu_limits_shared",
+)
+
 
 def _step35_common(cfg: ConfigContainer) -> None:
     """Apply the model-level settings shared by every Step-3.5 perf recipe.
@@ -90,6 +103,41 @@ def _use_pp4_vpp3_layout(cfg: ConfigContainer) -> None:
     cfg.model.num_layers_in_last_pipeline_stage = None
 
 
+def _set_mtp_num_layers(cfg: ConfigContainer, mtp_num_layers: int) -> None:
+    """Set ``mtp_num_layers`` and shrink the per-layer override lists to match.
+
+    ``Step35Bridge.provider_bridge`` fills ``rotary_base_per_layer`` (and the
+    other lists in ``_STEP35_PER_LAYER_FIELDS``) straight from the HF config, so
+    they are sized for the checkpoint's stock MTP depth. Megatron-Core asserts
+    ``len(rotary_base_per_layer) == num_layers + mtp_num_layers``, so lowering
+    ``mtp_num_layers`` without trimming these lists fails config validation.
+
+    Only the trailing MTP entries are dropped; the ``num_layers`` decoder
+    entries and the first ``mtp_num_layers`` MTP entries keep their global layer
+    indices, which is what ``Step35TransformerLayer`` looks them up by.
+    """
+    old_mtp_num_layers = cfg.model.mtp_num_layers or 0
+    if mtp_num_layers > old_mtp_num_layers:
+        raise ValueError(
+            f"Cannot raise mtp_num_layers from {old_mtp_num_layers} to {mtp_num_layers}: "
+            "the per-layer override lists come from the HF config and have no entries to extend with."
+        )
+
+    num_layers = cfg.model.num_layers
+    old_length = num_layers + old_mtp_num_layers
+    new_length = num_layers + mtp_num_layers
+
+    for field_name in _STEP35_PER_LAYER_FIELDS:
+        values = getattr(cfg.model, field_name, None)
+        # Leave anything that is not a full-depth per-layer list alone: unset
+        # fields, and lists the provider sized by some other rule.
+        if values is None or len(values) != old_length:
+            continue
+        setattr(cfg.model, field_name, list(values[:new_length]))
+
+    cfg.model.mtp_num_layers = mtp_num_layers
+
+
 def _enable_full_iteration_mxfp8(cfg: ConfigContainer) -> None:
     """Switch a Step-3.5 recipe to full-iteration CUDA graph capture.
 
@@ -103,7 +151,7 @@ def _enable_full_iteration_mxfp8(cfg: ConfigContainer) -> None:
     deviation from the model's reference shape, applied only to the
     full-iteration MXFP8 recipes; the TE-graph recipes keep all 3 MTP layers.
     """
-    cfg.model.mtp_num_layers = 1
+    _set_mtp_num_layers(cfg, 1)
     cfg.model.cuda_graph_impl = "full_iteration"
     cfg.model.cuda_graph_scope = []
     cfg.rng.te_rng_tracker = True
