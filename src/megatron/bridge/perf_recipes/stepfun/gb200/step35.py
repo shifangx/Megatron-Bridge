@@ -18,9 +18,11 @@ Two measured scales are exported per precision:
 * 64 GPUs  — PP=8, EP=8,  GBS=1024
 * 256 GPUs — PP=8, EP=32, GBS=8192
 
-plus a 256-GPU MXFP8 ``large_scale`` proxy at GBS=512.
+plus two MXFP8-only points: a 256-GPU ``large_scale`` proxy at GBS=512, and a
+128-GPU half-scale twin at GBS=4096 for when 64 nodes is more queue wait than the
+measurement is worth.
 
-The MXFP8 recipes at 256 GPUs are the exception: they capture the whole
+The MXFP8 recipes at 128 and 256 GPUs are the exception: they capture the whole
 iteration in one CUDA graph and run EP A2A overlap, which needs a non-None VPP,
 so they use PP=4 / VPP=3 with an explicit 45-layer pipeline layout and a single
 MTP layer. See ``stepfun/common.py`` for the constraints behind that.
@@ -158,6 +160,19 @@ def step35_196b_a11b_pretrain_64gpu_gb200_fp8mx_config() -> ConfigContainer:
 def step35_196b_a11b_pretrain_64gpu_gb200_nvfp4_config() -> ConfigContainer:
     """Step-3.5-Flash 196B-A11B pretrain: 64× GB200, NVFP4, PP=8 EP=8."""
     return _te_graph_config("nvfp4", expert_model_parallel_size=8, global_batch_size=1024)
+
+
+def step35_196b_a11b_pretrain_128gpu_gb200_fp8mx_config() -> ConfigContainer:
+    """Step-3.5-Flash 196B-A11B pretrain: 128× GB200, MXFP8, PP=4 VPP=3 EP=32.
+
+    Half-scale twin of the 256-GPU MXFP8 point, for when 64 nodes is more queue
+    wait than the measurement is worth. Everything per-GPU is identical — same
+    PP=4/VPP=3 layout, same EP=32, same MBS=1 — and GBS is halved with the GPU
+    count so tokens/GPU/step, and therefore the TFLOP/s/GPU it reports, stay
+    directly comparable to the 256-GPU run. TP=1 PP=4 CP=1 leaves DP=32, so EP=32
+    exactly covers the DP dimension with no expert replication.
+    """
+    return _full_iter_mxfp8_config(expert_model_parallel_size=32, global_batch_size=4096)
 
 
 def step35_196b_a11b_pretrain_256gpu_gb200_bf16_config() -> ConfigContainer:
