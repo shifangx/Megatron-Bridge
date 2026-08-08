@@ -19,6 +19,11 @@ Two measured scales are exported per precision:
 * 256 GPUs — PP=8, EP=32, GBS=8192
 
 plus a 256-GPU MXFP8 ``large_scale`` proxy at GBS=512.
+
+The MXFP8 recipes at 256 GPUs are the exception: they capture the whole
+iteration in one CUDA graph and run EP A2A overlap, which needs a non-None VPP,
+so they use PP=4 / VPP=3 with an explicit 45-layer pipeline layout and a single
+MTP layer. See ``stepfun/common.py`` for the constraints behind that.
 """
 
 from megatron.bridge.perf_recipes.environment import COMMON_PERF_ENV_VARS
@@ -29,6 +34,7 @@ from megatron.bridge.perf_recipes.stepfun.common import (
     _enable_full_iteration_mxfp8,
     _perf_precision,
     _step35_common,
+    _use_pp4_vpp3_layout,
     step35_196b_a11b_pretrain_config,
 )
 
@@ -113,13 +119,16 @@ def _full_iter_mxfp8_config(*, expert_model_parallel_size: int, global_batch_siz
     _step35_common(cfg)
 
     cfg.model.tensor_model_parallel_size = 1
-    cfg.model.pipeline_model_parallel_size = 8
     cfg.model.context_parallel_size = 1
     cfg.model.expert_model_parallel_size = expert_model_parallel_size
     cfg.model.expert_tensor_parallel_size = 1
     cfg.model.sequence_parallel = False
     cfg.train.global_batch_size = global_batch_size
     cfg.train.micro_batch_size = 1
+
+    # PP=4 / VPP=3 via an explicit layout: EP A2A overlap (enabled below) needs a
+    # non-None VPP, which the default 45-layer uneven PP=8 split cannot provide.
+    _use_pp4_vpp3_layout(cfg)
 
     _benchmark_common(cfg)
     _enable_full_iteration_mxfp8(cfg)
@@ -162,7 +171,7 @@ def step35_196b_a11b_pretrain_256gpu_gb200_fp8cs_config() -> ConfigContainer:
 
 
 def step35_196b_a11b_pretrain_256gpu_gb200_fp8mx_config() -> ConfigContainer:
-    """Step-3.5-Flash 196B-A11B pretrain: 256× GB200, MXFP8, PP=8 EP=32."""
+    """Step-3.5-Flash 196B-A11B pretrain: 256× GB200, MXFP8, PP=4 VPP=3 EP=32."""
     return _full_iter_mxfp8_config(expert_model_parallel_size=32, global_batch_size=8192)
 
 
@@ -172,5 +181,5 @@ def step35_196b_a11b_pretrain_256gpu_gb200_nvfp4_config() -> ConfigContainer:
 
 
 def step35_196b_a11b_pretrain_256gpu_gb200_fp8mx_large_scale_config() -> ConfigContainer:
-    """Step-3.5-Flash 196B-A11B pretrain: 256× GB200, MXFP8, PP=8 EP=32, GBS=512 proxy."""
+    """Step-3.5-Flash 196B-A11B pretrain: 256× GB200, MXFP8, PP=4 VPP=3 EP=32, GBS=512 proxy."""
     return _full_iter_mxfp8_config(expert_model_parallel_size=32, global_batch_size=512)

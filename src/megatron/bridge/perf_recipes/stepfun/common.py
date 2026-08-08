@@ -26,10 +26,17 @@ from megatron.bridge.training.config import ConfigContainer
 
 # Step-3.5-Flash has 45 decoder layers (3 dense + 42 MoE). PP=8 does not divide
 # 45, so a fixed uneven split is required (6 + 6*6 + 3 = 45). This matches the
-# validated Step-3.7 sbatch layout. VPP stays None everywhere: 45 is not
-# divisible by PP*VPP, and enabling VPP would require an explicit pp_layout.
+# validated Step-3.7 sbatch layout. VPP stays None on this path: 45 is not
+# divisible by PP*VPP, so any VPP needs the explicit layout below instead.
 _NUM_LAYERS_IN_FIRST_PP_STAGE = 6
 _NUM_LAYERS_IN_LAST_PP_STAGE = 3
+
+# Explicit PP=4 / VPP=3 layout used by the full-iteration MXFP8 path, which needs
+# a non-None VPP for EP A2A overlap. Expands to 12 stages (VPP = 12 // PP = 3):
+#   Ettt | tttt x10 | ttmL   ->  3 + 40 + 2 = 45 decoder layers, 1 MTP layer.
+_STEP35_PP4_VPP3_LAYOUT = "Et*3|(t*4|)*10t*2mL"
+_STEP35_PP4_VPP3_PP_SIZE = 4
+_STEP35_PP4_VPP3_VPP_SIZE = 3
 
 
 def _step35_common(cfg: ConfigContainer) -> None:
@@ -68,13 +75,35 @@ def _step35_common(cfg: ConfigContainer) -> None:
     cfg.model.moe_shared_expert_overlap = False
 
 
+def _use_pp4_vpp3_layout(cfg: ConfigContainer) -> None:
+    """Replace the default uneven PP=8 split with the explicit PP=4 / VPP=3 layout.
+
+    EP A2A overlap requires a non-None ``virtual_pipeline_model_parallel_size``
+    at PP>1, which the 45-layer uneven split cannot provide. Megatron-Core also
+    rejects an explicit layout combined with any of the coarse split knobs, so
+    ``num_layers_in_{first,last}_pipeline_stage`` are cleared here.
+    """
+    cfg.model.pipeline_model_parallel_size = _STEP35_PP4_VPP3_PP_SIZE
+    cfg.model.virtual_pipeline_model_parallel_size = _STEP35_PP4_VPP3_VPP_SIZE
+    cfg.model.pipeline_model_parallel_layout = _STEP35_PP4_VPP3_LAYOUT
+    cfg.model.num_layers_in_first_pipeline_stage = None
+    cfg.model.num_layers_in_last_pipeline_stage = None
+
+
 def _enable_full_iteration_mxfp8(cfg: ConfigContainer) -> None:
     """Switch a Step-3.5 recipe to full-iteration CUDA graph capture.
 
     Dropless MoE produces variable-shaped per-expert tensors that CUDA graphs
     cannot capture, so pad to a fixed capacity and use paged stashing to recover
     the memory the padding costs.
+
+    MTP is cut to a single layer here. ``CommOverlapConfig.setup`` asserts
+    ``mtp_num_layers in (None, 0, 1)`` when EP A2A overlap is on, so Step-3.5's
+    stock 3 MTP layers cannot be kept on this path. This is a deliberate
+    deviation from the model's reference shape, applied only to the
+    full-iteration MXFP8 recipes; the TE-graph recipes keep all 3 MTP layers.
     """
+    cfg.model.mtp_num_layers = 1
     cfg.model.cuda_graph_impl = "full_iteration"
     cfg.model.cuda_graph_scope = []
     cfg.rng.te_rng_tracker = True
