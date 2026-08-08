@@ -153,10 +153,21 @@ def _run_training(args, cli_overrides: list[str]) -> None:
     if args.dryrun:
         save_path = args.save_config_filepath or "ConfigContainer.yaml"
         os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-        if "WORLD_SIZE" not in os.environ and "SLURM_NTASKS" not in os.environ:
-            os.environ["WORLD_SIZE"] = str(args.num_gpus)
-        if "RANK" not in os.environ and "SLURM_PROCID" not in os.environ:
-            os.environ["RANK"] = "0"
+        # A dry run validates the config for the *target* scale named by
+        # --num_gpus, so that scale wins over whatever the launcher reports.
+        # Deferring to the launcher makes the common `srun -N1 -n1 ... --dryrun`
+        # pre-check validate a 1-GPU world (SLURM_NTASKS=1) and silently miss
+        # every parallelism-dependent assertion the real job would hit.
+        # safe_get_world_size() reads WORLD_SIZE ahead of SLURM_NTASKS, so
+        # setting it here is enough to override the allocation.
+        launcher_world_size = os.environ.get("WORLD_SIZE") or os.environ.get("SLURM_NTASKS")
+        if launcher_world_size is not None and int(launcher_world_size) != args.num_gpus:
+            logger.info(
+                f"dryrun: validating against --num_gpus={args.num_gpus} "
+                f"instead of the launcher world size ({launcher_world_size})"
+            )
+        os.environ["WORLD_SIZE"] = str(args.num_gpus)
+        os.environ["RANK"] = "0"
         runtime_config_update(recipe)
         recipe.to_yaml(save_path)
         logger.info(f"ConfigContainer saved to: {os.path.abspath(save_path)}")
