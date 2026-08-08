@@ -74,16 +74,6 @@ def _enable_full_iteration_mxfp8(cfg: ConfigContainer) -> None:
     Dropless MoE produces variable-shaped per-expert tensors that CUDA graphs
     cannot capture, so pad to a fixed capacity and use paged stashing to recover
     the memory the padding costs.
-
-    Unlike the Qwen3-235B equivalent this does NOT enable EP A2A overlap.
-    Step-3.5 runs 3 MTP layers, and ``CommOverlapConfig.setup`` rejects
-    ``overlap_moe_expert_parallel_comm`` unless ``mtp_num_layers in (None, 0, 1)``
-    (megatron/bridge/training/comm_overlap.py). The same path also requires a
-    non-None ``virtual_pipeline_model_parallel_size`` at PP>1, which Step-3.5's
-    45 layers cannot supply without an explicit pipeline layout. Since
-    ``delay_wgrad_compute`` in turn asserts that A2A overlap is on, it is dropped
-    too, along with the two knobs that only matter alongside A2A overlap
-    (``high_priority_a2a_comm_stream`` and ``moe_hybridep_num_sms_preprocessing``).
     """
     cfg.model.cuda_graph_impl = "full_iteration"
     cfg.model.cuda_graph_scope = []
@@ -97,9 +87,14 @@ def _enable_full_iteration_mxfp8(cfg: ConfigContainer) -> None:
     cfg.model.moe_paged_stash_buffer_size_factor_cuda = 1.2
     cfg.model.moe_paged_stash_buffer_size_factor_cpu = 1.0
 
-    # CuTe DSL fused grouped MLP (NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 in env_vars).
+    cfg.model.high_priority_a2a_comm_stream = True
     cfg.model.use_transformer_engine_op_fuser = True
     cfg.model.moe_mlp_glu_interleave_size = 32
+    cfg.model.moe_hybridep_num_sms_preprocessing = 32
 
     cfg.mixed_precision.fp8_dot_product_attention = True
-    cfg.comm_overlap = CommOverlapConfig(tp_comm_overlap=True)
+    cfg.comm_overlap = CommOverlapConfig(
+        tp_comm_overlap=True,
+        overlap_moe_expert_parallel_comm=True,
+        delay_wgrad_compute=True,
+    )
