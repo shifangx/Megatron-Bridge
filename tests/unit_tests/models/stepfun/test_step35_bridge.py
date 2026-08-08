@@ -14,6 +14,7 @@
 
 """Unit tests for Step35Bridge (Step-3.5-Flash)."""
 
+import inspect
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -521,7 +522,7 @@ class TestBuildStep35LayerSpec:
             submodules=SimpleNamespace(mlp=SimpleNamespace()),
         )
 
-    def _build(self, layer_specs):
+    def _build(self, layer_specs, **kw):
         fake_block = SimpleNamespace(layer_specs=layer_specs)
         fake_dense_mtp = SimpleNamespace(module="placeholder")
         cfg = SimpleNamespace(qk_layernorm=True)
@@ -533,7 +534,7 @@ class TestBuildStep35LayerSpec:
                 return_value=fake_dense_mtp,
             ) as mock_dense,
         ):
-            out = build_step35_layer_spec(cfg)
+            out = build_step35_layer_spec(cfg, **kw)
         return out, fake_dense_mtp, mock_block, mock_dense, cfg
 
     def test_moe_shared_experts_rebound_to_step35_shared_expert_mlp(self):
@@ -541,7 +542,7 @@ class TestBuildStep35LayerSpec:
         out, fake_dense_mtp, mock_block, mock_dense, cfg = self._build([moe_spec])
 
         # Builders were invoked with the Step35-specific kwargs.
-        mock_block.assert_called_once_with(cfg, use_transformer_engine=True, normalization="RMSNorm")
+        mock_block.assert_called_once_with(cfg, use_transformer_engine=True, normalization="RMSNorm", vp_stage=None)
         mock_dense.assert_called_once_with(num_experts=None, moe_grouped_gemm=False, qk_layernorm=True)
 
         # The MoE spec's ``shared_experts`` was rebound to ``Step35SharedExpertMLP``
@@ -585,6 +586,20 @@ class TestBuildStep35LayerSpec:
         assert new_shared.func is Step35SharedExpertMLP
         assert new_shared.keywords == original_partial.keywords
         assert list(out.layer_specs) == [dense_spec, moe_spec]
+
+    def test_vp_stage_named_in_signature_so_provider_forwards_it(self):
+        """``GPTModelProvider.provide`` probes the signature for ``vp_stage``.
+
+        A VAR_KEYWORD-only signature reads as "does not accept vp_stage", so the
+        stage would never be forwarded and ``get_num_layers_to_build`` would
+        assert under virtual pipelining.
+        """
+        assert "vp_stage" in inspect.signature(build_step35_layer_spec).parameters
+
+    def test_vp_stage_forwarded_to_block_builder(self):
+        _, _, mock_block, _, cfg = self._build([self._dense_spec()], vp_stage=2)
+
+        mock_block.assert_called_once_with(cfg, use_transformer_engine=True, normalization="RMSNorm", vp_stage=2)
 
 
 # ---------------------------------------------------------------------------

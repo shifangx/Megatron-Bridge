@@ -14,6 +14,7 @@
 
 """Unit tests for Step37Bridge (Step3.7) layer-spec wiring."""
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -91,8 +92,18 @@ class TestGetStep37TextLayerSpec:
         with patch.object(_step37_block_mod, "build_step35_layer_spec", return_value=sentinel_out) as builder:
             out = get_step37_text_layer_spec(sentinel_cfg, num_experts=None)
 
-        builder.assert_called_once_with(sentinel_cfg, num_experts=None)
+        builder.assert_called_once_with(sentinel_cfg, vp_stage=None, num_experts=None)
         assert out is sentinel_out
+
+    def test_vp_stage_named_in_signature_and_forwarded(self):
+        """``GPTModelProvider.provide`` only forwards ``vp_stage`` if the signature names it."""
+        assert "vp_stage" in inspect.signature(get_step37_text_layer_spec).parameters
+
+        sentinel_cfg = object()
+        with patch.object(_step37_block_mod, "build_step35_layer_spec") as builder:
+            get_step37_text_layer_spec(sentinel_cfg, vp_stage=1)
+
+        builder.assert_called_once_with(sentinel_cfg, vp_stage=1)
 
     def test_module_exposes_public_builder(self):
         assert _step37_block_mod.build_step35_layer_spec is build_step35_layer_spec

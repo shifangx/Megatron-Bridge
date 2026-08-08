@@ -14,7 +14,7 @@
 
 import logging
 from functools import partial
-from typing import Dict, Mapping
+from typing import Dict, Mapping, Optional
 
 import torch
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -138,7 +138,7 @@ class _MTPDenseLayerSpecsList(list):
         return super().__getitem__(idx)
 
 
-def build_step35_layer_spec(cfg, **kw):
+def build_step35_layer_spec(cfg, vp_stage: Optional[int] = None, **kw):
     """Per-layer spec for Step3.5: dense for layers 0-2 and 45-47, MoE for 3-44.
 
     Also rewrites every main-decoder layer's ModuleSpec to use
@@ -146,11 +146,19 @@ def build_step35_layer_spec(cfg, **kw):
     custom layer reads ``cfg.layer_types`` at init time to determine whether
     the layer is a sliding-attention layer.
 
+    ``vp_stage`` is declared explicitly (rather than swallowed by ``**kw``)
+    because ``GPTModelProvider.provide`` decides whether to pass it by
+    inspecting this function's signature: a VAR_KEYWORD-only signature reads as
+    "does not accept vp_stage", so the stage would silently never arrive and
+    ``get_num_layers_to_build`` would assert once virtual pipelining is on.
+
     Returns a TransformerBlockSubmodules whose layer_specs list is wrapped in
     _MTPDenseLayerSpecsList so that get_gpt_mtp_block_spec_for_backend receives
     a dense ModuleSpec (via layer_specs[-1]) for the MTP transformer sub-layers.
     """
-    block_submodules = get_gpt_decoder_block_spec(cfg, use_transformer_engine=True, normalization="RMSNorm", **kw)
+    block_submodules = get_gpt_decoder_block_spec(
+        cfg, use_transformer_engine=True, normalization="RMSNorm", vp_stage=vp_stage, **kw
+    )
     # Swap the layer module class on every main-decoder spec. The dense MTP
     # spec below is used for MTP layers (which have their own 1-indexed
     # layer_number namespace) so the routed-expert FFN stays disabled even
