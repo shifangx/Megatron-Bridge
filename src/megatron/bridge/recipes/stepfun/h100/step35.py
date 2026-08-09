@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import torch
 
 from megatron.bridge import AutoBridge
@@ -19,6 +21,17 @@ from megatron.bridge.recipes.common import _pretrain_common
 from megatron.bridge.recipes.utils.environment_utils import COMMON_RECIPE_ENV_VARS
 from megatron.bridge.training.config import ConfigContainer
 from megatron.bridge.training.flex_dispatcher_backend import apply_flex_dispatcher_backend
+
+
+# Resolve the Step-3.5-Flash source. Prefer a local snapshot via ``STEP35_HF_PATH``
+# and fall back to the HF Hub id. transformers 5.x refuses to resolve the hub
+# repo's custom ``step3p5`` config without ``trust_remote_code`` (it raises
+# "Unrecognized model ... Should have a model_type key"), but a *local directory*
+# loads cleanly against the ``Step35Config`` class that
+# ``megatron.bridge.models.stepfun`` registers with ``AutoConfig`` at import
+# time. Pointing at a downloaded snapshot therefore avoids both the hub
+# round-trip (compute nodes are usually offline) and trust_remote_code.
+_STEP35_HF_PATH = os.environ.get("STEP35_HF_PATH", "stepfun-ai/Step-3.5-Flash")
 
 
 def step35_196b_a11b_pretrain_512gpu_h100_bf16_config() -> ConfigContainer:
@@ -29,10 +42,10 @@ def step35_196b_a11b_pretrain_512gpu_h100_bf16_config() -> ConfigContainer:
     cfg = _pretrain_common()
 
     # Model config
-    cfg.model = AutoBridge.from_hf_pretrained("stepfun-ai/Step-3.5-Flash").to_megatron_provider(load_weights=False)
+    cfg.model = AutoBridge.from_hf_pretrained(_STEP35_HF_PATH).to_megatron_provider(load_weights=False)
 
     # Tokenizer (--tokenizer-model)
-    cfg.tokenizer.tokenizer_model = "stepfun-ai/Step-3.5-Flash"
+    cfg.tokenizer.tokenizer_model = _STEP35_HF_PATH
 
     # Dataset config - mock data by default
     cfg.dataset.blend = None  # Pass the path to the dataset here if not using mock data, along with weight. Ex: (["path/to/data1"], 0.2), [("path/to/data2", 0.8)]
