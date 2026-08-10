@@ -34,8 +34,8 @@ IMPORTANT — 45-layer constraints (enforced in step35_llm_pretrain.py):
   * virtual_pipeline_model_parallel_size stays None by default (45 is not
     divisible by PP*VPP; enabling VPP requires an explicit pp_layout). The
     GB200 FP8_MX V2 preset is the exception: it sets VPP=3 with an explicit
-    pp_layout ("Et|(t*2|)*21t|tL", 24 virtual stages), and the builder then
-    clears the fixed first/last split in favor of that layout.
+    12-stage pp_layout, and the builder then clears the fixed first/last split
+    in favor of that layout.
 
 These presets mirror the Qwen3-235B tuning as a *starting point*; the exact
 per-GPU/precision knobs should be perf-validated for Step-3.5.
@@ -190,13 +190,14 @@ STEP35_196B_A11B_PRETRAIN_CONFIG_GB200_FP8_MX_V2 = replace(
     cutedsl_fused_grouped_mlp=True,
     fp8_dot_product_attention=True,
     mtp_num_layers=1,
-    # Explicit PP=8 / VPP=3 layout for the 45 decoder layers + 1 MTP layer
-    # (24 virtual stages). First stage = 1 layer (+embedding), the next 22
-    # stages hold 2 layers each, and the last stage holds the MTP layer (+loss)
-    # -> 1 + 22*2 = 45 decoder layers, 1 MTP layer.
-    # This replaces the default fixed 6/3 first/last split (see step35_llm_pretrain).
+    # Nsys- and sweep-validated 256-GPU topology: PP4/VPP3/EP16. Decoder
+    # counts per physical PP rank are [12, 13, 12, 8], with the extra PP1
+    # decoder in its first virtual chunk and dense MTP isolated in the final
+    # chunk. This replaces the fixed first/last split in the recipe builder.
+    pipeline_model_parallel_size=4,
+    expert_model_parallel_size=16,
     virtual_pipeline_model_parallel_size=3,
-    pp_layout="Et|(t*2|)*22mL",
+    pp_layout="Et*4|t*5|(t*4|)*9mL",
 )
 STEP35_196B_A11B_PRETRAIN_CONFIG_GB200_NVFP4_V2 = STEP35_196B_A11B_PRETRAIN_CONFIG_GB200_FP8_CS_V2
 

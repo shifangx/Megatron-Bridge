@@ -129,6 +129,10 @@ def _build(gpu: str, precision: str, config_variant: str, *, tp_comm_overlap: bo
 
     set_step35_common_configs(cfg)
     set_workload_base_configs(cfg, base_cfg)
+    if gpu == "gb200" and precision == "fp8_mx" and config_variant == "v2":
+        # Sweep-validated HybridEP resource allocation for the 256-GPU preset.
+        cfg.model.moe_hybridep_num_sms = 48
+        cfg.model.moe_hybridep_num_sms_preprocessing = 48
     # A preset may carry an explicit VPP pp_layout string (e.g. GB200 FP8_MX V2).
     # That string fully specifies the per-virtual-stage layer split, so it replaces
     # the fixed uneven first/last split from set_step35_common_configs -- the two are
