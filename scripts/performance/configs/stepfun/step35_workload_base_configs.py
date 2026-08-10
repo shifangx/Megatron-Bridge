@@ -190,12 +190,12 @@ STEP35_196B_A11B_PRETRAIN_CONFIG_GB200_FP8_MX_V2 = replace(
     cutedsl_fused_grouped_mlp=True,
     fp8_dot_product_attention=True,
     mtp_num_layers=1,
-    # Nsys- and sweep-validated 256-GPU topology: PP4/VPP3/EP16. Decoder
+    # Nsys- and sweep-validated 256-GPU topology: PP4/VPP3/EP32. Decoder
     # counts per physical PP rank are [12, 13, 12, 8], with the extra PP1
     # decoder in its first virtual chunk and dense MTP isolated in the final
     # chunk. This replaces the fixed first/last split in the recipe builder.
     pipeline_model_parallel_size=4,
-    expert_model_parallel_size=16,
+    expert_model_parallel_size=32,
     virtual_pipeline_model_parallel_size=3,
     pp_layout="Et*4|t*5|(t*4|)*9mL",
 )
