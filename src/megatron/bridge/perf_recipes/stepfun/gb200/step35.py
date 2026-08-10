@@ -22,8 +22,9 @@ plus a 256-GPU MXFP8 ``large_scale`` proxy at GBS=512.
 
 The MXFP8 recipes at 256 GPUs are the exception: they capture the whole
 iteration in one CUDA graph and run EP A2A overlap, which needs a non-None VPP,
-so they use PP=4 / VPP=3 with an explicit 45-layer pipeline layout and a single
-MTP layer. See ``stepfun/common.py`` for the constraints behind that.
+so they use PP=4 / VPP=3 with an explicit 45-layer pipeline layout and MTP
+disabled (EP A2A overlap does not support Step-3.5's dense MTP layer). See
+``stepfun/common.py`` for the constraints behind that.
 """
 
 from megatron.bridge.perf_recipes.environment import COMMON_PERF_ENV_VARS

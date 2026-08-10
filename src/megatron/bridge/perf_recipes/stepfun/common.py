@@ -33,8 +33,11 @@ _NUM_LAYERS_IN_LAST_PP_STAGE = 3
 
 # Explicit PP=4 / VPP=3 layout used by the full-iteration MXFP8 path, which needs
 # a non-None VPP for EP A2A overlap. Expands to 12 stages (VPP = 12 // PP = 3):
-#   Ettt | tttt x10 | ttmL   ->  3 + 40 + 2 = 45 decoder layers, 1 MTP layer.
-_STEP35_PP4_VPP3_LAYOUT = "Et*3|(t*4|)*10t*2mL"
+#   Ettt | tttt x10 | ttL   ->  3 + 40 + 2 = 45 decoder layers, no MTP layer.
+# EP A2A overlap does not support Step-3.5's dense MTP layer, so MTP is disabled
+# on this path (see ``_enable_full_iteration_mxfp8``) and the layout carries no
+# ``m`` entry.
+_STEP35_PP4_VPP3_LAYOUT = "Et*3|(t*4|)*10t*2L"
 _STEP35_PP4_VPP3_PP_SIZE = 4
 _STEP35_PP4_VPP3_VPP_SIZE = 3
 
@@ -103,8 +106,12 @@ def _use_pp4_vpp3_layout(cfg: ConfigContainer) -> None:
     cfg.model.num_layers_in_last_pipeline_stage = None
 
 
-def _set_mtp_num_layers(cfg: ConfigContainer, mtp_num_layers: int) -> None:
+def _set_mtp_num_layers(cfg: ConfigContainer, mtp_num_layers: int | None) -> None:
     """Set ``mtp_num_layers`` and shrink the per-layer override lists to match.
+
+    ``mtp_num_layers`` may be ``None`` to disable MTP entirely; it is treated as
+    depth 0 for the list-trimming math but written back verbatim so the model
+    reports MTP as off.
 
     ``Step35Bridge.provider_bridge`` fills ``rotary_base_per_layer`` (and the
     other lists in ``_STEP35_PER_LAYER_FIELDS``) straight from the HF config, so
@@ -117,7 +124,8 @@ def _set_mtp_num_layers(cfg: ConfigContainer, mtp_num_layers: int) -> None:
     indices, which is what ``Step35TransformerLayer`` looks them up by.
     """
     old_mtp_num_layers = cfg.model.mtp_num_layers or 0
-    if mtp_num_layers > old_mtp_num_layers:
+    new_mtp_num_layers = mtp_num_layers or 0
+    if new_mtp_num_layers > old_mtp_num_layers:
         raise ValueError(
             f"Cannot raise mtp_num_layers from {old_mtp_num_layers} to {mtp_num_layers}: "
             "the per-layer override lists come from the HF config and have no entries to extend with."
@@ -125,7 +133,7 @@ def _set_mtp_num_layers(cfg: ConfigContainer, mtp_num_layers: int) -> None:
 
     num_layers = cfg.model.num_layers
     old_length = num_layers + old_mtp_num_layers
-    new_length = num_layers + mtp_num_layers
+    new_length = num_layers + new_mtp_num_layers
 
     for field_name in _STEP35_PER_LAYER_FIELDS:
         values = getattr(cfg.model, field_name, None)
@@ -145,13 +153,15 @@ def _enable_full_iteration_mxfp8(cfg: ConfigContainer) -> None:
     cannot capture, so pad to a fixed capacity and use paged stashing to recover
     the memory the padding costs.
 
-    MTP is cut to a single layer here. ``CommOverlapConfig.setup`` asserts
-    ``mtp_num_layers in (None, 0, 1)`` when EP A2A overlap is on, so Step-3.5's
-    stock 3 MTP layers cannot be kept on this path. This is a deliberate
+    MTP is disabled here. ``CommOverlapConfig.setup`` asserts
+    ``mtp_num_layers in (None, 0, 1)`` when EP A2A overlap is on, and while that
+    admits a single MTP layer, Step-3.5's one MTP layer is a *dense* layer, which
+    EP A2A overlap does not support. Setting ``mtp_num_layers`` to ``None`` sheds
+    that layer and works around the known limitation. This is a deliberate
     deviation from the model's reference shape, applied only to the
     full-iteration MXFP8 recipes; the TE-graph recipes keep all 3 MTP layers.
     """
-    _set_mtp_num_layers(cfg, 1)
+    _set_mtp_num_layers(cfg, None)
     cfg.model.cuda_graph_impl = "full_iteration"
     cfg.model.cuda_graph_scope = []
     cfg.rng.te_rng_tracker = True
