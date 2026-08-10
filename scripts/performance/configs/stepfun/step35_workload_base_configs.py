@@ -197,7 +197,7 @@ STEP35_196B_A11B_PRETRAIN_CONFIG_GB200_FP8_MX_V2 = replace(
     pipeline_model_parallel_size=4,
     expert_model_parallel_size=32,
     virtual_pipeline_model_parallel_size=3,
-    pp_layout="Et*4|t*5|(t*4|)*9mL",
+    pp_layout="Et*4|t*4|(t*4|)*9tmL",
 )
 STEP35_196B_A11B_PRETRAIN_CONFIG_GB200_NVFP4_V2 = STEP35_196B_A11B_PRETRAIN_CONFIG_GB200_FP8_CS_V2
 
