@@ -41,6 +41,13 @@ _STEP35_PP4_VPP3_LAYOUT = "Et*3|(t*4|)*10t*2L"
 _STEP35_PP4_VPP3_PP_SIZE = 4
 _STEP35_PP4_VPP3_VPP_SIZE = 3
 
+# Explicit PP=4 (no VPP) layout used by the per-op TE-graph recipes, which do not
+# enable EP A2A overlap and so do not need the non-None VPP the full-iteration
+# MXFP8 path forces. Four stages, one per PP rank:
+#   Et*12 | t*12 | t*12 | t*9L   ->  12 + 12 + 12 + 9 = 45 decoder layers, no MTP.
+_STEP35_PP4_LAYOUT = "Et*12|t*12|t*12|t*9L"
+_STEP35_PP4_PP_SIZE = 4
+
 # Step-3.5 per-layer overrides that ``Step35TransformerLayer`` indexes by the
 # *global* 0-indexed layer id. MTP layers sit right after the decoder layers
 # (indices ``num_layers .. num_layers + mtp_num_layers - 1``), so each of these
@@ -102,6 +109,22 @@ def _use_pp4_vpp3_layout(cfg: ConfigContainer) -> None:
     cfg.model.pipeline_model_parallel_size = _STEP35_PP4_VPP3_PP_SIZE
     cfg.model.virtual_pipeline_model_parallel_size = _STEP35_PP4_VPP3_VPP_SIZE
     cfg.model.pipeline_model_parallel_layout = _STEP35_PP4_VPP3_LAYOUT
+    cfg.model.num_layers_in_first_pipeline_stage = None
+    cfg.model.num_layers_in_last_pipeline_stage = None
+
+
+def _use_pp4_layout(cfg: ConfigContainer) -> None:
+    """Replace the default uneven PP=8 split with the explicit PP=4 (no VPP) layout.
+
+    Unlike ``_use_pp4_vpp3_layout`` this keeps
+    ``virtual_pipeline_model_parallel_size`` at None: the per-op TE-graph recipes
+    do not enable EP A2A overlap, so they do not need a non-None VPP. Megatron-Core
+    rejects an explicit layout combined with the coarse split knobs, so
+    ``num_layers_in_{first,last}_pipeline_stage`` are cleared here.
+    """
+    cfg.model.pipeline_model_parallel_size = _STEP35_PP4_PP_SIZE
+    cfg.model.virtual_pipeline_model_parallel_size = None
+    cfg.model.pipeline_model_parallel_layout = _STEP35_PP4_LAYOUT
     cfg.model.num_layers_in_first_pipeline_stage = None
     cfg.model.num_layers_in_last_pipeline_stage = None
 

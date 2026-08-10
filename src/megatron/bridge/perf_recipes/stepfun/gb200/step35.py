@@ -15,16 +15,22 @@
 
 Two measured scales are exported per precision:
 
-* 64 GPUs  — PP=8, EP=8,  GBS=1024
-* 256 GPUs — PP=8, EP=32, GBS=8192
+* 64 GPUs  — PP=8, EP=8,  GBS=1024  (per-op TE CUDA graphs, MTP on)
+* 128 GPUs — PP=4, EP=32, GBS=8192  (MTP off)
 
-plus a 256-GPU MXFP8 ``large_scale`` proxy at GBS=512.
+plus a 128-GPU MXFP8 ``large_scale`` proxy at GBS=512.
 
-The MXFP8 recipes at 256 GPUs are the exception: they capture the whole
-iteration in one CUDA graph and run EP A2A overlap, which needs a non-None VPP,
-so they use PP=4 / VPP=3 with an explicit 45-layer pipeline layout and MTP
-disabled (EP A2A overlap does not support Step-3.5's dense MTP layer). See
-``stepfun/common.py`` for the constraints behind that.
+Every 128-GPU recipe runs PP=4 / EP=32 with MTP disabled, but the pipeline layout
+splits by path:
+
+* BF16 / FP8-CS / NVFP4 keep the per-op TE CUDA graphs and use the plain PP=4
+  (no VPP) 45-layer layout ``Et*12|t*12|t*12|t*9L``.
+* MXFP8 (incl. ``large_scale``) captures the whole iteration in one CUDA graph and
+  runs EP A2A overlap, which needs a non-None VPP, so it uses PP=4 / VPP=3 with the
+  ``Et*3|(t*4|)*10t*2L`` layout. (EP A2A overlap also does not support Step-3.5's
+  dense MTP layer, which is the original reason MTP is disabled.)
+
+See ``stepfun/common.py`` for the constraints behind the layouts.
 """
 
 from megatron.bridge.perf_recipes.environment import COMMON_PERF_ENV_VARS
@@ -34,7 +40,9 @@ from megatron.bridge.perf_recipes.stepfun.common import (
     _benchmark_common,
     _enable_full_iteration_mxfp8,
     _perf_precision,
+    _set_mtp_num_layers,
     _step35_common,
+    _use_pp4_layout,
     _use_pp4_vpp3_layout,
     step35_196b_a11b_pretrain_config,
 )
@@ -141,6 +149,27 @@ def _full_iter_mxfp8_config(*, expert_model_parallel_size: int, global_batch_siz
     return cfg
 
 
+def _te_graph_pp4_config(
+    precision: str, *, expert_model_parallel_size: int, global_batch_size: int
+) -> ConfigContainer:
+    """TE-CUDA-graph Step-3.5 recipe forced onto the explicit PP=4 (no VPP) layout with MTP off.
+
+    Starts from the default PP=8 TE-graph benchmark config, then swaps in the
+    45-layer ``Et*12|t*12|t*12|t*9L`` PP=4 layout and disables MTP. The layout
+    carries no MTP (``m``) entry, so MTP must be off for the per-stage layer counts
+    to line up. Unlike the full-iteration MXFP8 path this keeps the per-op TE CUDA
+    graphs, does not enable EP A2A overlap, and so leaves VPP unset.
+    """
+    cfg = _te_graph_config(
+        precision,
+        expert_model_parallel_size=expert_model_parallel_size,
+        global_batch_size=global_batch_size,
+    )
+    _use_pp4_layout(cfg)
+    _set_mtp_num_layers(cfg, None)
+    return cfg
+
+
 def step35_196b_a11b_pretrain_64gpu_gb200_bf16_config() -> ConfigContainer:
     """Step-3.5-Flash 196B-A11B pretrain: 64× GB200, BF16, PP=8 EP=8."""
     return _te_graph_config("bf16", expert_model_parallel_size=8, global_batch_size=1024)
@@ -161,26 +190,26 @@ def step35_196b_a11b_pretrain_64gpu_gb200_nvfp4_config() -> ConfigContainer:
     return _te_graph_config("nvfp4", expert_model_parallel_size=8, global_batch_size=1024)
 
 
-def step35_196b_a11b_pretrain_256gpu_gb200_bf16_config() -> ConfigContainer:
-    """Step-3.5-Flash 196B-A11B pretrain: 256× GB200, BF16, PP=8 EP=32."""
-    return _te_graph_config("bf16", expert_model_parallel_size=32, global_batch_size=8192)
+def step35_196b_a11b_pretrain_128gpu_gb200_bf16_config() -> ConfigContainer:
+    """Step-3.5-Flash 196B-A11B pretrain: 128× GB200, BF16, PP=4 EP=32, MTP off."""
+    return _te_graph_pp4_config("bf16", expert_model_parallel_size=32, global_batch_size=8192)
 
 
-def step35_196b_a11b_pretrain_256gpu_gb200_fp8cs_config() -> ConfigContainer:
-    """Step-3.5-Flash 196B-A11B pretrain: 256× GB200, FP8 current-scaling, PP=8 EP=32."""
-    return _te_graph_config("fp8_cs", expert_model_parallel_size=32, global_batch_size=8192)
+def step35_196b_a11b_pretrain_128gpu_gb200_fp8cs_config() -> ConfigContainer:
+    """Step-3.5-Flash 196B-A11B pretrain: 128× GB200, FP8 current-scaling, PP=4 EP=32, MTP off."""
+    return _te_graph_pp4_config("fp8_cs", expert_model_parallel_size=32, global_batch_size=8192)
 
 
-def step35_196b_a11b_pretrain_256gpu_gb200_fp8mx_config() -> ConfigContainer:
-    """Step-3.5-Flash 196B-A11B pretrain: 256× GB200, MXFP8, PP=4 VPP=3 EP=32."""
+def step35_196b_a11b_pretrain_128gpu_gb200_fp8mx_config() -> ConfigContainer:
+    """Step-3.5-Flash 196B-A11B pretrain: 128× GB200, MXFP8, PP=4 VPP=3 EP=32."""
     return _full_iter_mxfp8_config(expert_model_parallel_size=32, global_batch_size=8192)
 
 
-def step35_196b_a11b_pretrain_256gpu_gb200_nvfp4_config() -> ConfigContainer:
-    """Step-3.5-Flash 196B-A11B pretrain: 256× GB200, NVFP4, PP=8 EP=32."""
-    return _te_graph_config("nvfp4", expert_model_parallel_size=32, global_batch_size=8192)
+def step35_196b_a11b_pretrain_128gpu_gb200_nvfp4_config() -> ConfigContainer:
+    """Step-3.5-Flash 196B-A11B pretrain: 128× GB200, NVFP4, PP=4 EP=32, MTP off."""
+    return _te_graph_pp4_config("nvfp4", expert_model_parallel_size=32, global_batch_size=8192)
 
 
-def step35_196b_a11b_pretrain_256gpu_gb200_fp8mx_large_scale_config() -> ConfigContainer:
-    """Step-3.5-Flash 196B-A11B pretrain: 256× GB200, MXFP8, PP=4 VPP=3 EP=32, GBS=512 proxy."""
+def step35_196b_a11b_pretrain_128gpu_gb200_fp8mx_large_scale_config() -> ConfigContainer:
+    """Step-3.5-Flash 196B-A11B pretrain: 128× GB200, MXFP8, PP=4 VPP=3 EP=32, GBS=512 proxy."""
     return _full_iter_mxfp8_config(expert_model_parallel_size=32, global_batch_size=512)
