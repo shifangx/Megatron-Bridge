@@ -1138,6 +1138,7 @@ def training_log(
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string)
+        reported_memory_in_this_iteration = False
         if report_memory_flag:
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:
@@ -1148,10 +1149,21 @@ def training_log(
                 memory_string += f" | {metric}: {value}"
             if torch.distributed.get_rank(group=pg_collection.dp) == 0:
                 print("[Rank {}] {}".format(torch.distributed.get_rank(), memory_string), flush=True)
+            reported_memory_in_this_iteration = True
             if iteration > (loaded_iteration + 1):
                 # Make sure the memory after the second iteration is reported
                 # to include optimizer state memory.
                 report_memory_flag = False
+        if (
+            logger_config.log_memory_interval is not None
+            and iteration % logger_config.log_memory_interval == 0
+            and not reported_memory_in_this_iteration
+        ):
+            memory_string = f"(after {iteration} iterations) memory (GB)"
+            for metric, value in report_memory(logger_config.memory_keys).items():
+                memory_string += f" | {metric}: {value}"
+            if torch.distributed.get_rank(group=pg_collection.dp) == 0:
+                print("[Rank {}] {}".format(torch.distributed.get_rank(), memory_string), flush=True)
         timers.log(timers_to_log, normalizer=logger_config.log_interval)
 
     return report_memory_flag

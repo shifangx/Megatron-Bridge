@@ -634,6 +634,9 @@ class LoggerConfig(MTrainLoggerConfig):
     skip_train_metrics_log: bool = False
     """Skips logging of training metrics to all logging backends and to the console as well."""
 
+    log_memory_interval: int | None = None
+    """Print CUDA memory statistics to stdout every N training iterations."""
+
     timing_log_level: Literal[-1, 0, 1, 2] = 0
     """Granularity level to measure and report timing.
     -1: To disable timing logging as the timer start from 0 and above.
@@ -682,6 +685,8 @@ class LoggerConfig(MTrainLoggerConfig):
 
     def finalize(self) -> None:
         """Validate logger settings and optional MLFlow dependency."""
+        if self.log_memory_interval is not None and self.log_memory_interval <= 0:
+            raise ValueError("logger.log_memory_interval must be a positive integer or None.")
         if self.mlflow_experiment and (self.mlflow_run_name is None or self.mlflow_run_name == ""):
             raise ValueError("Set logger.mlflow_run_name when enabling MLFlow logging.")
 
