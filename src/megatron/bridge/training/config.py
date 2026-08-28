@@ -637,6 +637,20 @@ class LoggerConfig(MTrainLoggerConfig):
     log_memory_interval: int | None = None
     """Print CUDA memory statistics to stdout every N training iterations."""
 
+    reset_memory_peak_each_iteration: bool = False
+    """Reset the CUDA caching allocator's peak counters at the start of every training iteration.
+
+    The `mem-max-*` values reported by `report_memory` (peak allocated / active /
+    inactive / reserved) come from `torch.cuda.memory_stats()`, whose peaks are
+    running maxima over the whole process. Once an early iteration sets a
+    high-water mark -- typically a warmup one, before CUDA graphs are captured --
+    every later iteration keeps re-reporting that same number, which hides what
+    steady state actually costs. With this enabled,
+    `torch.cuda.reset_peak_memory_stats()` runs at the top of each iteration, so
+    each reported peak covers exactly the iteration it is logged for. The
+    `current_*` metrics are unaffected.
+    """
+
     timing_log_level: Literal[-1, 0, 1, 2] = 0
     """Granularity level to measure and report timing.
     -1: To disable timing logging as the timer start from 0 and above.

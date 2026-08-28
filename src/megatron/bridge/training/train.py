@@ -375,6 +375,19 @@ def train(
 
     # Run training iterations till done.
     while global_state.train_state.step < train_config.train_iters:
+        # Open a fresh peak-memory window for this iteration. torch's
+        # `allocated_bytes.all.peak` / `reserved_bytes.all.peak` (and the active /
+        # inactive peaks) are running maxima since process start, so without this
+        # the `mem-max-*` numbers that training_log prints at the end of this
+        # iteration describe the worst iteration so far -- usually a warmup one --
+        # not this one. Reset here, at the top of the loop body, so the window is
+        # exactly one full iteration: it closes at the training_log call below,
+        # which is still inside this same iteration. Host-side allocator
+        # bookkeeping only: no kernels, no sync, and the peaks are reset to the
+        # current values rather than to zero.
+        if config.logger.reset_memory_peak_each_iteration:
+            torch.cuda.reset_peak_memory_stats()
+
         # Handle profiling for this step
         nvtx_ctx = handle_profiling_step(
             prof_config,
