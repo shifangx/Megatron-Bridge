@@ -107,6 +107,12 @@ def start_memory_history_recording(profiling: ProfilingConfig | None) -> None:
     Without this call, dumped snapshots contain only the current live
     allocations — no timeline, no call sites.
 
+    Recording uses ``context="all"`` so free events carry their own stack. With
+    the weaker ``context="alloc"``, PyTorch reuses the allocation context for
+    free events, and every free in the snapshot appears to come from the line
+    that allocated the block — which makes "who released this tensor?"
+    unanswerable from the dump.
+
     Must be invoked before model construction so every tensor allocation is
     captured. Guarded by ``profile_ranks`` so only ranks that will dump a
     snapshot pay the recording overhead.
@@ -117,11 +123,19 @@ def start_memory_history_recording(profiling: ProfilingConfig | None) -> None:
         return
 
     torch.cuda.memory._record_memory_history(
-        True,
+        # Keep the full alloc/free timeline (not just the live-block state).
+        "all",
+        # Capture a stack on *every* trace event, including free_requested /
+        # free_completed. The legacy `trace_alloc_record_context=True` form only
+        # reached RecordContext::ALLOC, so free events fell back to
+        # `block->context_when_allocated` and memory_viz showed the allocation
+        # stack again instead of the site that actually released the block.
+        context="all",
+        # Python frames only; C++ frames bloat the snapshot without helping to
+        # identify the releasing call site.
+        stacks="python",
         # Retain up to 100k alloc/free events.
-        trace_alloc_max_entries=100_000,
-        # Record the Python stack at each event — lets memory_viz show call sites.
-        trace_alloc_record_context=True,
+        max_entries=100_000,
     )
 
     def _oom_observer(device: int, alloc: int, device_alloc: int, device_free: int) -> None:

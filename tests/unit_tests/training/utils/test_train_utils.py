@@ -3768,12 +3768,15 @@ class TestStartMemoryHistoryRecording:
 
         start_memory_history_recording(profiling)
 
-        # Recording enabled with MLM-compatible settings
+        # Recording enabled with the full-timeline settings
         mock_record.assert_called_once()
         _pos, kwargs = mock_record.call_args
-        assert _pos[0] is True
-        assert kwargs["trace_alloc_max_entries"] == 100_000
-        assert kwargs["trace_alloc_record_context"] is True
+        assert _pos[0] == "all"
+        assert kwargs["max_entries"] == 100_000
+        # context="all" is what makes free events carry their own stack instead
+        # of reusing the allocation context.
+        assert kwargs["context"] == "all"
+        assert kwargs["stacks"] == "python"
 
         # OOM observer was attached
         mock_attach.assert_called_once()
