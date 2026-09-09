@@ -118,7 +118,15 @@ def _patch_mcore_expert_bias_padding_mask() -> None:
             assert flat_mask.shape[0] == routing_map.shape[0], (
                 f"padding_mask flat {flat_mask.shape} vs routing_map {routing_map.shape}"
             )
-            padding_mask = flat_mask.unsqueeze(-1)
+            # Hand MCore the FLAT mask. The pinned MCore already carries the #6111
+            # fix: routing() flattens (router.py:768) and _apply_expert_bias does
+            # its own `(~padding_mask).unsqueeze(-1)` (router.py:746). Unsqueezing
+            # here as well made the mask [T, 1] -> [T, 1, 1], so
+            # `routing_map [T, E] & mask` broadcast to [T, T, E] and
+            # `.sum(dim=0)` returned [T, E] against a [E] buffer:
+            #   RuntimeError: output with shape torch.Size([512]) doesn't match
+            #   the broadcast shape (1024, 512)
+            padding_mask = flat_mask
         current_apply_expert_bias(self, routing_map, padding_mask=padding_mask)
 
     setattr(_apply_expert_bias, _MCORE_EXPERT_BIAS_PADDING_MASK_PATCHED, True)
