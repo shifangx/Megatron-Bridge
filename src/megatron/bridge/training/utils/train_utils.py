@@ -27,6 +27,7 @@ import torch.nn as nn
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.moe_logging import get_moe_metric_tensor_size
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
@@ -986,6 +987,11 @@ def training_log(
         if getattr(config.model, "moe_z_loss_coeff", None) is not None:
             track_names.append("z_loss")
 
+        # `layers` feeds the averaging denominator, not the tensor shape: for a
+        # hybrid model the MoE layers are the "E" slots of the pattern, not all
+        # of num_layers. The tensor shape is metric_tensor_size below -- the two
+        # are different quantities, and conflating them sized the force_initialize
+        # tensor wrongly for every hybrid model.
         if getattr(config.model, "is_hybrid_model", False):
             layers = getattr(config.model, "hybrid_layer_pattern", "").count("E")
         else:
@@ -1006,6 +1012,7 @@ def training_log(
             num_layers=layers,
             moe_layer_freq=getattr(config.model, "moe_layer_freq", None),
             mtp_num_layers=getattr(config.model, "mtp_num_layers", None),
+            metric_tensor_size=get_moe_metric_tensor_size(config.model),
             pg_collection=pg_collection,
         )
     if getattr(config.model, "mtp_num_layers", None) is not None:
