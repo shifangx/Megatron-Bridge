@@ -62,6 +62,8 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError("WORLD_SIZE must be divisible by ETP*EP*PP for distributed CPU export.")
     if args.command == "import" and args.device == "cpu" and args.low_memory_save:
         raise ValueError("--low-memory-save is only supported by the GPU backend.")
+    if args.command == "import" and args.device == "cpu" and args.random_init:
+        raise ValueError("--random-init is only supported by the GPU backend.")
     if args.command == "export":
         if args.save_every_n_ranks < 1:
             raise ValueError("--save-every-n-ranks must be at least 1.")
@@ -98,6 +100,7 @@ def _run_import(args: argparse.Namespace) -> None:
         ep=args.ep,
         etp=args.etp,
         low_memory_save=args.low_memory_save,
+        random_init=args.random_init,
         distributed_timeout_minutes=args.distributed_timeout_minutes,
     )
 

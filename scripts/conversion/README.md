@@ -106,6 +106,27 @@ increase conversion time, so enable it only when the default path does not fit:
   --low-memory-save
 ```
 
+### Random-initialized control checkpoints
+
+`--random-init` builds the Megatron model from the Hugging Face architecture but
+keeps its random initialization instead of importing the Hugging Face weights.
+Architecture, parallel layout, tokenizer metadata, and on-disk layout are
+identical to a real import, so the result is a drop-in from-scratch control for
+an A/B against a converted checkpoint: point the training run at one or the
+other and change nothing else. GPU backend only.
+
+```bash
+./scripts/conversion/convert.sh import \
+  --executor slurm \
+  --device gpu \
+  --nodes 1 \
+  --gpus-per-node 8 \
+  --hf-model MODEL \
+  --megatron-path /workspace/models/large-model_random_init \
+  --tp 1 --pp 1 --ep 8 --etp 1 \
+  --random-init
+```
+
 No cluster-specific `srun` flags are added by default. If the target cluster
 requires extra flags, repeat `--srun-arg=ARG`. For example, a Pyxis/Enroot
 cluster may use:

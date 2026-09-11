@@ -102,6 +102,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Round-trip validation requires the GPU backend.")
     if args.command == "import" and args.device == "cpu" and args.low_memory_save:
         raise ValueError("--low-memory-save is only supported by the GPU backend.")
+    if args.command == "import" and args.device == "cpu" and args.random_init:
+        raise ValueError("--random-init is only supported by the GPU backend.")
 
     distributed_cpu = args.device == "cpu" and args.cpu_processes_per_node > 1
     if args.device == "cpu":

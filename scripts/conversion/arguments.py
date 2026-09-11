@@ -271,6 +271,15 @@ Examples:
         action="store_true",
         help="Reduce peak GPU memory while saving large imported checkpoints at the cost of additional runtime.",
     )
+    import_parser.add_argument(
+        "--random-init",
+        action="store_true",
+        help=(
+            "Build the Megatron model from the Hugging Face architecture but keep its random initialization "
+            "instead of importing the Hugging Face weights (GPU backend only). Produces a checkpoint that is "
+            "byte-compatible with a real import, for use as a from-scratch control run."
+        ),
+    )
 
     export_parser = subparsers.add_parser(
         "export",
@@ -380,6 +389,8 @@ def conversion_worker_args(args: argparse.Namespace) -> list[str]:
     if args.command == "import":
         if args.low_memory_save:
             worker_args.append("--low-memory-save")
+        if args.random_init:
+            worker_args.append("--random-init")
     elif args.command == "export":
         worker_args.extend(["--hf-path", args.hf_path])
         if args.no_progress:

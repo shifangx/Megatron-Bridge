@@ -290,6 +290,7 @@ def import_checkpoint(
     low_memory_save: bool,
     distributed_timeout_minutes: int | None,
     overwrite: bool,
+    random_init: bool = False,
 ) -> None:
     """Import a Hugging Face model into a distributed Megatron checkpoint.
 
@@ -306,12 +307,17 @@ def import_checkpoint(
         low_memory_save: Reduce peak GPU memory while saving the imported checkpoint.
         distributed_timeout_minutes: Process-group timeout in minutes.
         overwrite: Delete a non-empty destination before conversion.
+        random_init: Keep the provider's random initialization instead of importing
+            the Hugging Face weights. The architecture, parallel layout, tokenizer
+            metadata, and on-disk layout are unchanged, so the result is a drop-in
+            from-scratch control for a checkpoint produced by a real import.
     """
     _ensure_distributed_initialized(distributed_timeout_minutes)
     _prepare_distributed_output(megatron_path, overwrite=overwrite, source_paths=[hf_model])
     dtype = parse_dtype(torch_dtype)
 
-    print_rank_0(f"GPU import: {hf_model} -> {megatron_path}")
+    source_description = f"{hf_model} (architecture only, random weights)" if random_init else hf_model
+    print_rank_0(f"GPU import: {source_description} -> {megatron_path}")
     print_rank_0(f"Parallelism: TP={tp} PP={pp} EP={ep} ETP={etp}; dtype={torch_dtype}")
     revision_kwargs = {"revision": hf_revision} if hf_revision is not None else {}
     bridge = AutoBridge.from_hf_pretrained(
@@ -320,7 +326,7 @@ def import_checkpoint(
         torch_dtype=dtype,
         **revision_kwargs,
     )
-    model_provider = bridge.to_megatron_provider(load_weights=True)
+    model_provider = bridge.to_megatron_provider(load_weights=not random_init)
     _configure_model_provider(model_provider, tp=tp, pp=pp, ep=ep, etp=etp, dtype=dtype)
     _maybe_generate_pipeline_layout(bridge, model_provider, pp)
     model_provider.finalize()
