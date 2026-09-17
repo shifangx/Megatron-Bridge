@@ -91,9 +91,12 @@ def get_batch_from_iterator(
             required_device_keys.add("padding_mask")
 
     if is_first_pp_stage or is_last_pp_stage:
+        # The last stage needs both for MTP, which is forced onto the final
+        # pipeline stage and derives its targets from the token ids: see
+        # HybridModel.mtp_process and the assert in its forward(). The first
+        # stage needs them to build the decoder embeddings.
         input_key = "tokens" if batch.get("tokens") is not None else "input_ids"
         required_device_keys.add(input_key)
-    if is_first_pp_stage:
         required_device_keys.add("position_ids")
     if is_last_pp_stage:
         required_device_keys.update(("labels", "loss_mask"))
